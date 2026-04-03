@@ -3,7 +3,7 @@ from pathlib import Path
 from setuptools import find_packages, setup
 
 
-package_name = "lktech_motors_testing"
+package_name = "bldc_can_tools"
 
 
 def package_files(source_dir: str, install_root: str) -> list[tuple[str, list[str]]]:
@@ -40,16 +40,18 @@ setup(
     zip_safe=False,
     maintainer="gerardo",
     maintainer_email="gerardodelcid16@gmail.com",
-    description="Windows-first LKTech motor test utilities built as an ament_python package.",
+    description="Windows-first multi-family BLDC CAN utilities built as an ament_python package.",
     license="MIT",
     tests_require=["pytest"],
     entry_points={
         "console_scripts": [
-            "lktech_monitor = lktech_motors_testing.monitor_node:main",
-            "lktech_position_test = lktech_motors_testing.position_test_node:main",
-            "lktech_cli_read_angle = lktech_motors_testing.cli_read_angle:main",
-            "lktech_cli_position_test = lktech_motors_testing.cli_position_test:main",
-            "lktech_can_health_check = lktech_motors_testing.cli_can_health_check:main",
+            "lktech_monitor = bldc_can_tools.monitor_node:main",
+            "lktech_position_test = bldc_can_tools.position_test_node:main",
+            "lktech_cli_read_angle = bldc_can_tools.cli_read_angle:main",
+            "lktech_cli_position_test = bldc_can_tools.cli_position_test:main",
+            "lktech_can_health_check = bldc_can_tools.cli_can_health_check:main",
+            "bldc_ze300_read = bldc_can_tools.cli_ze300_read:main",
         ],
     },
 )
+

@@ -7,8 +7,8 @@ import sys
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from lktech_motors_testing.ginkgo_can_interface import GinkgoAdapterConfig
-    from lktech_motors_testing.motor_driver import LKTechMotorDriver
+    from bldc_can_tools.ginkgo_can_interface import GinkgoAdapterConfig
+    from bldc_can_tools.motor_driver import LKTechMotorDriver
 else:
     from .ginkgo_can_interface import GinkgoAdapterConfig
     from .motor_driver import LKTechMotorDriver
@@ -81,3 +81,4 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

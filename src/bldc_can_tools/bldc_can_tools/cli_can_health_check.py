@@ -9,7 +9,7 @@ import time
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from lktech_motors_testing.ginkgo_can_interface import (
+    from bldc_can_tools.ginkgo_can_interface import (
         BIT_TIMINGS_KBPS,
         CANControllerStatus,
         GinkgoAdapterConfig,
@@ -172,3 +172,4 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

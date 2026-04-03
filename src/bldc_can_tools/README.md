@@ -1,11 +1,12 @@
-# `src/lktech_motors_testing`
+# `src/bldc_can_tools`
 
-`src/lktech_motors_testing` is a Python `ament_python` package for testing LKTech or LingKong CAN motors with a Ginkgo USB-CAN adapter.
+`src/bldc_can_tools` is a Python `ament_python` package for testing multiple BLDC CAN driver families, including LKTech or LingKong motors and ZE300-style drivers.
 
 The code is intentionally split into:
 
 - a dedicated Ginkgo CAN transport layer
 - centralized LKTech protocol helpers
+- room for additional driver-family protocol helpers such as ZE300-style drivers
 - a high-level motor driver with software zero-offset handling
 - direct Python CLIs and a practical CAN sniffer
 - optional ROS 2 nodes and launch/config files
@@ -45,7 +46,7 @@ Some LKTech-specific details may still differ by motor firmware, manual revision
 From the workspace root:
 
 ```bash
-colcon build --packages-select lktech_motors_testing
+colcon build --packages-select bldc_can_tools
 ```
 
 ## Source And Run
@@ -63,32 +64,32 @@ Windows ROS 2 prompt:
 call install\setup.bat
 ```
 
-For direct Python usage on Windows, you can also run the tools from inside `src/lktech_motors_testing` without building the ROS package first, as long as Python can see the package folder and the Ginkgo vendor SDK can load.
+For direct Python usage on Windows, you can also run the tools from inside `src/bldc_can_tools` without building the ROS package first, as long as Python can see the package folder and the Ginkgo vendor SDK can load.
 
 ## Windows-First Direct Python Usage
 
 Read the current angle once:
 
 ```powershell
-python -m lktech_motors_testing.cli_read_angle --channel 0 --bitrate 1000 --motor-id 15
+python -m bldc_can_tools.cli_read_angle --channel 0 --bitrate 1000 --motor-id 15
 ```
 
 Read the current angle and treat startup position as software zero:
 
 ```powershell
-python -m lktech_motors_testing.cli_read_angle --channel 0 --bitrate 1000 --motor-id 15 --capture-boot-offset
+python -m bldc_can_tools.cli_read_angle --channel 0 --bitrate 1000 --motor-id 15 --capture-boot-offset
 ```
 
 Send a motor-side target directly:
 
 ```powershell
-python -m lktech_motors_testing.cli_position_test --channel 0 --bitrate 1000 --motor-id 15 --motor-deg 180 --speed-dps-motor 90
+python -m bldc_can_tools.cli_position_test --channel 0 --bitrate 1000 --motor-id 15 --motor-deg 180 --speed-dps-motor 90
 ```
 
 Send a joint-side target that is converted through the reduction ratio and boot offset:
 
 ```powershell
-python -m lktech_motors_testing.cli_position_test --channel 0 --bitrate 1000 --motor-id 15 --reduction-ratio 6 --joint-deg 30 --speed-dps-joint 20
+python -m bldc_can_tools.cli_position_test --channel 0 --bitrate 1000 --motor-id 15 --reduction-ratio 6 --joint-deg 30 --speed-dps-joint 20
 ```
 
 ## Boot-Offset Logic
@@ -125,8 +126,8 @@ That means the position at startup becomes software zero.
 If you later want ROS 2 monitoring again:
 
 ```bash
-ros2 run lktech_motors_testing lktech_monitor --ros-args --params-file \
-  $(ros2 pkg prefix lktech_motors_testing)/share/lktech_motors_testing/config/default_params.yaml
+ros2 run bldc_can_tools lktech_monitor --ros-args --params-file \
+  $(ros2 pkg prefix bldc_can_tools)/share/bldc_can_tools/config/default_params.yaml
 ```
 
 Published topics:
@@ -150,13 +151,13 @@ ros2 topic pub --once /lktech/target_joint_deg std_msgs/msg/Float64 "{data: 15.0
 Read angle:
 
 ```powershell
-python -m lktech_motors_testing.cli_read_angle --help
+python -m bldc_can_tools.cli_read_angle --help
 ```
 
 Send one target:
 
 ```powershell
-python -m lktech_motors_testing.cli_position_test --help
+python -m bldc_can_tools.cli_position_test --help
 ```
 
 ## Run `cansniffer.py`
@@ -186,3 +187,4 @@ python scripts/cansniffer.py --channel 0 --bitrate 1000 --decode lktech --log-fi
 - The `0xA6` single-loop control helper is included as a scaffold and needs hardware confirmation before relying on it.
 - The meaning of returned angle fields in status replies may vary slightly across firmware revisions.
 - Ginkgo adapter access depends on the vendor SDK loading correctly on your machine.
+

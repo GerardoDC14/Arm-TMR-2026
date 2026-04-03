@@ -22,8 +22,8 @@ else:
 
 
 if __package__ in (None, ""):
-    from lktech_motors_testing.ginkgo_can_interface import GinkgoAdapterConfig
-    from lktech_motors_testing.motor_driver import LKTechMotorDriver
+    from bldc_can_tools.ginkgo_can_interface import GinkgoAdapterConfig
+    from bldc_can_tools.motor_driver import LKTechMotorDriver
 else:
     from .ginkgo_can_interface import GinkgoAdapterConfig
     from .motor_driver import LKTechMotorDriver
@@ -139,3 +139,4 @@ def main(argv: list[str] | None = None) -> None:
     finally:
         node.destroy_node()
         rclpy.shutdown()
+

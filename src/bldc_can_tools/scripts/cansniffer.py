@@ -11,16 +11,16 @@ PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 if str(PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_ROOT))
 
-from lktech_motors_testing.ginkgo_can_interface import (  # noqa: E402
+from bldc_can_tools.ginkgo_can_interface import (  # noqa: E402
     CANFilter,
     GinkgoAdapterConfig,
     GinkgoCANInterface,
 )
-from lktech_motors_testing.lktech_protocol import (  # noqa: E402
+from bldc_can_tools.lktech_protocol import (  # noqa: E402
     decode_lktech_frame,
     extract_motor_id_from_arbitration_id,
 )
-from lktech_motors_testing.utils import format_can_frame  # noqa: E402
+from bldc_can_tools.utils import format_can_frame  # noqa: E402
 
 
 def parse_int(value: str) -> int:
@@ -207,3 +207,4 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

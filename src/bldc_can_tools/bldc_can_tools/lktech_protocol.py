@@ -12,6 +12,9 @@ CMD_READ_SINGLE_LOOP_ANGLE = 0x94
 CMD_READ_STATE_1 = 0x9A
 CMD_READ_STATE_2 = 0x9C
 CMD_READ_STATE_3 = 0x9D
+CMD_MOTOR_OFF = 0x80
+CMD_MOTOR_STOP = 0x81
+CMD_MOTOR_ON = 0x88
 CMD_MULTI_LOOP_ANGLE_CONTROL_2 = 0xA4
 CMD_SINGLE_LOOP_ANGLE_CONTROL_2 = 0xA6
 
@@ -19,8 +22,8 @@ CMD_SINGLE_LOOP_ANGLE_CONTROL_2 = 0xA6
 @dataclass(frozen=True)
 class ArbitrationIdPolicy:
     request_base: int = 0x140
-    reply_base: int = 0x240
-    broadcast_request_id: int = 0x280
+    reply_base: int | None = None
+    broadcast_request_ids: tuple[int, ...] = (0x280, 0x281, 0x282, 0x288)
 
 
 DEFAULT_ARB_POLICY = ArbitrationIdPolicy()
@@ -106,8 +109,19 @@ def unpack_i16_le(data: bytes, offset: int) -> int:
     return int.from_bytes(data[offset : offset + 2], byteorder="little", signed=True)
 
 
+def unpack_u32_le(data: bytes, offset: int) -> int:
+    return int.from_bytes(data[offset : offset + 4], byteorder="little", signed=False)
+
+
 def unpack_i32_le(data: bytes, offset: int) -> int:
     return int.from_bytes(data[offset : offset + 4], byteorder="little", signed=True)
+
+
+def unpack_i56_le(data: bytes, offset: int) -> int:
+    raw = int.from_bytes(data[offset : offset + 7], byteorder="little", signed=False)
+    if raw & (1 << 55):
+        raw -= 1 << 56
+    return raw
 
 
 def build_request_arbitration_id(
@@ -121,6 +135,8 @@ def build_reply_arbitration_id(
     motor_id: int, policy: ArbitrationIdPolicy = DEFAULT_ARB_POLICY
 ) -> int:
     _validate_motor_id(motor_id)
+    if policy.reply_base is None or policy.reply_base == policy.request_base:
+        return policy.request_base + motor_id
     return policy.reply_base + motor_id
 
 
@@ -129,7 +145,11 @@ def extract_motor_id_from_arbitration_id(
 ) -> int | None:
     if policy.request_base < arbitration_id <= policy.request_base + 0xFF:
         return arbitration_id - policy.request_base
-    if policy.reply_base < arbitration_id <= policy.reply_base + 0xFF:
+    if (
+        policy.reply_base is not None
+        and policy.reply_base != policy.request_base
+        and policy.reply_base < arbitration_id <= policy.reply_base + 0xFF
+    ):
         return arbitration_id - policy.reply_base
     return None
 
@@ -137,11 +157,17 @@ def extract_motor_id_from_arbitration_id(
 def classify_arbitration_id(
     arbitration_id: int, policy: ArbitrationIdPolicy = DEFAULT_ARB_POLICY
 ) -> tuple[str | None, int | None]:
-    if arbitration_id == policy.broadcast_request_id:
+    if arbitration_id in policy.broadcast_request_ids:
         return "broadcast_request", None
     if policy.request_base < arbitration_id <= policy.request_base + 0xFF:
+        if policy.reply_base is None or policy.reply_base == policy.request_base:
+            return "single_motor", arbitration_id - policy.request_base
         return "request", arbitration_id - policy.request_base
-    if policy.reply_base < arbitration_id <= policy.reply_base + 0xFF:
+    if (
+        policy.reply_base is not None
+        and policy.reply_base != policy.request_base
+        and policy.reply_base < arbitration_id <= policy.reply_base + 0xFF
+    ):
         return "reply", arbitration_id - policy.reply_base
     return None, None
 
@@ -265,13 +291,18 @@ def build_singleloop_control2_request(
 
 def parse_multi_loop_angle_reply(data: bytes) -> float:
     _require_command(data, CMD_READ_MULTI_LOOP_ANGLE)
-    angle_cdeg = unpack_i32_le(data, 4)
+    # V2.36 LKTech CAN documentation describes the multi-loop angle reply as the
+    # command byte followed by a signed 56-bit little-endian centi-degree value.
+    angle_cdeg = unpack_i56_le(data, 1)
     return centidegrees_to_degrees(angle_cdeg)
 
 
 def parse_single_loop_angle_reply(data: bytes) -> float:
     _require_command(data, CMD_READ_SINGLE_LOOP_ANGLE)
-    angle_cdeg = unpack_u16_le(data, 6)
+    # The current working assumption from the V2.36 CAN examples is that the
+    # single-loop angle is stored as a 32-bit little-endian centi-degree value
+    # in DATA[4:8]. This still needs hardware verification on the exact motor.
+    angle_cdeg = unpack_u32_le(data, 4)
     return centidegrees_to_degrees(angle_cdeg)
 
 
@@ -331,6 +362,8 @@ def decode_lktech_frame(
     try:
         if direction in ("request", "broadcast_request"):
             return _decode_request_summary(command, data, motor_id)
+        if direction == "single_motor":
+            return _decode_single_motor_summary(command, data, motor_id)
         if direction == "reply":
             return _decode_reply_summary(command, data, motor_id)
     except Exception as exc:
@@ -398,6 +431,28 @@ def _decode_request_summary(command: int, data: bytes, motor_id: int | None) -> 
     return f"{prefix} unknown_command=0x{command:02X}"
 
 
+def _decode_single_motor_summary(
+    command: int,
+    data: bytes,
+    motor_id: int | None,
+) -> str | None:
+    prefix = f"single_motor motor_id={motor_id}" if motor_id is not None else "single_motor"
+
+    if _looks_like_read_request(command, data):
+        request_summary = _decode_request_summary(command, data, motor_id)
+        return request_summary.replace("request", prefix, 1) if request_summary else prefix
+
+    if command in (CMD_MOTOR_OFF, CMD_MOTOR_ON, CMD_MOTOR_STOP):
+        return f"{prefix} cmd=0x{command:02X} request_or_echo"
+
+    if command in (CMD_MULTI_LOOP_ANGLE_CONTROL_2, CMD_SINGLE_LOOP_ANGLE_CONTROL_2) and data[1] == 0x00:
+        request_summary = _decode_request_summary(command, data, motor_id)
+        return request_summary.replace("request", prefix, 1) if request_summary else prefix
+
+    reply_summary = _decode_reply_summary(command, data, motor_id)
+    return reply_summary.replace("reply", prefix, 1) if reply_summary else prefix
+
+
 def _decode_reply_summary(command: int, data: bytes, motor_id: int | None) -> str | None:
     prefix = f"reply motor_id={motor_id}" if motor_id is not None else "reply"
     if command == CMD_READ_MULTI_LOOP_ANGLE:
@@ -440,6 +495,18 @@ def _decode_reply_summary(command: int, data: bytes, motor_id: int | None) -> st
             f"encoder_counts={state.encoder_counts}"
         )
     return f"{prefix} unknown_command=0x{command:02X}"
+
+
+def _looks_like_read_request(command: int, data: bytes) -> bool:
+    if command not in (
+        CMD_READ_MULTI_LOOP_ANGLE,
+        CMD_READ_SINGLE_LOOP_ANGLE,
+        CMD_READ_STATE_1,
+        CMD_READ_STATE_2,
+        CMD_READ_STATE_3,
+    ):
+        return False
+    return all(byte == 0x00 for byte in data[1:])
 
 
 def _require_command(data: bytes, expected_command: int) -> None:

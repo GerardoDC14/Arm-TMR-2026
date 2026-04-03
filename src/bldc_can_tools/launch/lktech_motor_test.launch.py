@@ -8,7 +8,7 @@ from ament_index_python.packages import get_package_share_directory
 
 def generate_launch_description() -> LaunchDescription:
     default_params = (
-        get_package_share_directory("lktech_motors_testing")
+        get_package_share_directory("bldc_can_tools")
         + "/config/default_params.yaml"
     )
 
@@ -21,7 +21,7 @@ def generate_launch_description() -> LaunchDescription:
     params_file = LaunchConfiguration("params_file")
 
     monitor = Node(
-        package="lktech_motors_testing",
+        package="bldc_can_tools",
         executable="lktech_monitor",
         name="lktech_monitor",
         output="screen",
@@ -29,7 +29,7 @@ def generate_launch_description() -> LaunchDescription:
     )
 
     position_test = Node(
-        package="lktech_motors_testing",
+        package="bldc_can_tools",
         executable="lktech_position_test",
         name="lktech_position_test",
         output="screen",
@@ -37,3 +37,4 @@ def generate_launch_description() -> LaunchDescription:
     )
 
     return LaunchDescription([params_file_arg, monitor, position_test])
+
