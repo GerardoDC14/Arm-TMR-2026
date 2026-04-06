@@ -1,9 +1,9 @@
-# ROS 2 build artifacts
+# ── ROS 2 build artifacts ────────────────────────────────────────────────────
 build/
 install/
 log/
 
-# Python
+# ── Python ───────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -11,28 +11,55 @@ __pycache__/
 dist/
 *.so
 
-# Arduino / ESP32
-firmware/**/.arduino15/
-firmware/**/build/
-firmware/**/*.elf
-firmware/**/*.bin
-firmware/**/*.hex
-firmware/**/*.map
+# ── Arduino / ESP32 build output ─────────────────────────────────────────────
+# Arduino IDE 1.x / 2.x local build cache
+**/build-*/
+**/.arduino15/
+**/arduino_cache_*/
+# Compiled firmware artifacts (never commit binaries)
+**/*.elf
+**/*.bin
+**/*.hex
+**/*.map
+**/*.eep
+**/*.lst
+# arduino-cli export
+export/
 
-# IDEs
+# ── Windows vendor tools ──────────────────────────────────────────────────────
+# zadig.exe and similar one-off Windows binaries are checked in intentionally
+# under tools/ — add explicit exclusions here only if you want to stop tracking them
+# tools/zadig*.exe
+
+# ── IDEs ─────────────────────────────────────────────────────────────────────
 .vscode/
 .idea/
 *.swp
 *.swo
+*.orig
 
-# OS
+# ── OS ───────────────────────────────────────────────────────────────────────
 .DS_Store
+.DS_Store?
+._*
 Thumbs.db
+desktop.ini
 
-# ROS bags
+# ── ROS bags / recordings ─────────────────────────────────────────────────────
 *.bag
 *.db3
+*.mcap
 
-# Secrets / env
+# ── Serial / CAN logs ────────────────────────────────────────────────────────
+*.log
+can_log*.txt
+serial_log*.txt
+
+# ── Secrets / credentials ────────────────────────────────────────────────────
 .env
 *.pem
+*.key
+secrets.yaml
+
+# ── Codex / AI agent scratch ─────────────────────────────────────────────────
+.codex/
