@@ -1,0 +1,145 @@
+<robot name="Dicerox_URDFv1">
+
+  <link name="chassis_base_link">
+    <inertial>
+      <origin xyz="-6.0962E-06 -0.0098619 0.019556" rpy="0 0 0" />
+      <mass value="23.384" />
+      <inertia ixx="0.45314" ixy="-3.9592E-07" ixz="6.5591E-07" iyy="0.092646" iyz="2.3142E-05" izz="0.4283" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://dicerox_urdf_v1/meshes/visual/base_link.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.89804 0.91765 0.92941 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://dicerox_urdf_v1/meshes/collision/base_link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="Flipper1L">
+    <inertial>
+      <origin xyz="-0.038777 0.11447 4.8819E-06" rpy="0 0 0" />
+      <mass value="2.2681" />
+      <inertia ixx="0.030289" ixy="5.4004E-06" ixz="-3.6002E-09" iyy="0.0072507" iyz="5.3367E-07" izz="0.025427" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://dicerox_urdf_v1/meshes/visual/Flipper1L.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.75294 0.75294 0.75294 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://dicerox_urdf_v1/meshes/collision/Flipper1L.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="Flipper1J" type="revolute">
+    <origin xyz="-0.37013 0.265 0" rpy="3.1416 0 3.1416" />
+    <parent link="chassis_base_link" />
+    <child link="Flipper1L" />
+    <axis xyz="1 0 0" />
+    <limit lower="-1.5708" upper="1.5708" effort="1000" velocity="1.5" />
+    <dynamics damping="0.1" friction="0.1" />
+  </joint>
+  <link name="Flipper2L">
+    <inertial>
+      <origin xyz="0.038777 0.11447 -4.8819E-06" rpy="0 0 0" />
+      <mass value="2.2681" />
+      <inertia ixx="0.030289" ixy="-5.4004E-06" ixz="-3.6002E-09" iyy="0.0072507" iyz="-5.3367E-07" izz="0.025427" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://dicerox_urdf_v1/meshes/visual/Flipper2L.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.75294 0.75294 0.75294 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://dicerox_urdf_v1/meshes/collision/Flipper2L.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="Flipper2J" type="revolute">
+    <origin xyz="0.37013 0.265 0" rpy="3.1416 0 3.1416" />
+    <parent link="chassis_base_link" />
+    <child link="Flipper2L" />
+    <axis xyz="-1 0 0" />
+    <limit lower="-1.5708" upper="1.5708" effort="1000" velocity="1.5" />
+    <dynamics damping="0.1" friction="0.1" />
+  </joint>
+  <link name="Flipper3L">
+    <inertial>
+      <origin xyz="-0.038777 0.11447 4.8819E-06" rpy="0 0 0" />
+      <mass value="2.2681" />
+      <inertia ixx="0.030289" ixy="5.4004E-06" ixz="-3.6002E-09" iyy="0.0072507" iyz="5.3367E-07" izz="0.025427" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://dicerox_urdf_v1/meshes/visual/Flipper3L.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.75294 0.75294 0.75294 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://dicerox_urdf_v1/meshes/collision/Flipper3L.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="Flipper3J" type="revolute">
+    <origin xyz="-0.37013 -0.265 0" rpy="3.1416 0 3.1416" />
+    <parent link="chassis_base_link" />
+    <child link="Flipper3L" />
+    <axis xyz="1 0 0" />
+    <limit lower="-1.5708" upper="1.5708" effort="1000" velocity="1.5" />
+    <dynamics damping="0.1" friction="0.1" />
+  </joint>
+  <link name="Flipper4L">
+    <inertial>
+      <origin xyz="0.038777 0.11447 -4.8819E-06" rpy="0 0 0" />
+      <mass value="2.2681" />
+      <inertia ixx="0.030289" ixy="-5.4004E-06" ixz="-3.6002E-09" iyy="0.0072507" iyz="-5.3367E-07" izz="0.025427" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://dicerox_urdf_v1/meshes/visual/Flipper4L.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.75294 0.75294 0.75294 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://dicerox_urdf_v1/meshes/collision/Flipper4L.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="Flipper4J" type="revolute">
+    <origin xyz="0.37013 -0.265 0" rpy="3.1416 0 -3.1416" />
+    <parent link="chassis_base_link" />
+    <child link="Flipper4L" />
+    <axis xyz="-1 0 0" />
+    <limit lower="-1.5708" upper="1.5708" effort="1000" velocity="1.5" />
+    <dynamics damping="0.1" friction="0.1" />
+  </joint>
+</robot>

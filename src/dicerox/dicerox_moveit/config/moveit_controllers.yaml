@@ -1,0 +1,29 @@
+# MoveIt uses this configuration for controller management
+
+moveit_controller_manager: moveit_simple_controller_manager/MoveItSimpleControllerManager
+
+moveit_simple_controller_manager:
+  controller_names:
+    - dicerox_arm_controller
+    - dicerox_flippers_controller
+
+  dicerox_arm_controller:
+    type: FollowJointTrajectory
+    joints:
+      - Joint1
+      - Joint2
+      - Joint3
+      - Joint4
+      - Joint5
+      - Joint6
+    action_ns: follow_joint_trajectory
+    default: true
+  dicerox_flippers_controller:
+    type: FollowJointTrajectory
+    joints:
+      - Flipper1J
+      - Flipper2J
+      - Flipper3J
+      - Flipper4J
+    action_ns: follow_joint_trajectory
+    default: true

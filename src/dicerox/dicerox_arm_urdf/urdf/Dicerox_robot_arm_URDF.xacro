@@ -1,0 +1,202 @@
+<robot name="Dicerox_robot_arm_URDF">
+
+  <link name="world_link" />
+
+  <!-- Rotate the CAD-exported base so the robot stands upright in RViz/MoveIt. -->
+  <joint name="world_link_to_base_link" type="fixed">
+    <origin xyz="0 0 0" rpy="3.141592653589793 0 0" />
+    <parent link="world_link" />
+    <child link="base_link" />
+  </joint>
+
+  <link name="base_link">
+    <inertial>
+      <origin xyz="-9.49825873871185E-05 -1.04297722111363E-06 0.0144742771636322" rpy="0 0 0" />
+      <mass value="0.616927576087879" />
+      <inertia ixx="0.00235120961653514" ixy="1.48592051070372E-08" ixz="1.72093144714663E-07" iyy="0.000752293306588767" iyz="8.93709469162573E-10" izz="0.0030503193907466" />
+    </inertial>
+    <!-- Visual and collision geometry intentionally omitted:
+         the chassis URDF (dicerox_urdf_v1) provides the complete base_link mesh.
+         Keeping geometry here would cause duplicate/overlapping models in RViz. -->
+  </link>
+  <link name="Link1">
+    <inertial>
+      <origin xyz="-1.5987E-06 0.024748 -0.061373" rpy="0 0 0" />
+      <mass value="0.40272" />
+      <inertia ixx="0.00020115" ixy="8.9742E-10" ixz="1.4855E-08" iyy="0.00029101" iyz="5.2612E-06" izz="0.00020797" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://dicerox_arm_urdf/meshes/visual/Link1.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://dicerox_arm_urdf/meshes/collision/Link1.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="Joint1" type="revolute">
+    <origin xyz="0 0 -0.02135" rpy="0 0 0" />
+    <parent link="base_link" />
+    <child link="Link1" />
+    <axis xyz="0 0 1" />
+    <limit lower="-1.5708" upper="1.5708" effort="1000" velocity="1000" />
+    <dynamics damping="0.1" friction="0.1" />
+  </joint>
+  <link name="Link2">
+    <inertial>
+      <origin xyz="-0.243045429859638 -0.0135631154060198 0.0109133250229265" rpy="0 0 0" />
+      <mass value="0.850434760512325" />
+      <inertia ixx="0.000566538415993394" ixy="-0.000197628674376634" ixz="5.15412905692302E-05" iyy="0.00151204564961416" iyz="-2.74040675259699E-05" izz="0.0016954901326145" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://dicerox_arm_urdf/meshes/visual/Link2.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://dicerox_arm_urdf/meshes/collision/Link2.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="Joint2" type="revolute">
+    <origin xyz="0 0 -0.085" rpy="-1.5708 -0.0523599 0" />
+    <parent link="Link1" />
+    <child link="Link2" />
+    <axis xyz="0 0 1" />
+    <limit lower="-3.1416" upper="1.5708" effort="1000" velocity="1000" />
+    <dynamics damping="0.1" friction="0.1" />
+  </joint>
+  <link name="Link3">
+    <inertial>
+      <origin xyz="0.144477857773968 0.0250963518852683 -0.00383266973549601" rpy="0 0 0" />
+      <mass value="0.583243866421534" />
+      <inertia ixx="0.000369010255911609" ixy="-7.60066997552285E-05" ixz="-5.44971341604371E-05" iyy="0.000787611709577075" iyz="-9.53787377811168E-06" izz="0.000837010731417748" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://dicerox_arm_urdf/meshes/visual/Link3.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://dicerox_arm_urdf/meshes/collision/Link3.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="Joint3" type="revolute">
+    <origin xyz="-0.37445 0.024154 0" rpy="0 0 -0.064417" />
+    <parent link="Link2" />
+    <child link="Link3" />
+    <axis xyz="0 0 1" />
+    <limit lower="-1.5708" upper="1.5708" effort="1000" velocity="1000" />
+    <dynamics damping="0.1" friction="0.1" />
+  </joint>
+  <link name="Link4">
+    <inertial>
+      <origin xyz="0.0017238 0.0060777 -0.34018" rpy="0 0 0" />
+      <mass value="0.1006" />
+      <inertia ixx="3.1596E-05" ixy="-1.2772E-07" ixz="3.2611E-07" iyy="4.0916E-05" iyz="3.9956E-06" izz="2.3493E-05" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://dicerox_arm_urdf/meshes/visual/Link4.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://dicerox_arm_urdf/meshes/collision/Link4.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="Joint4" type="revolute">
+    <origin xyz="0 0 0" rpy="-1.5708 0 1.7395" />
+    <parent link="Link3" />
+    <child link="Link4" />
+    <axis xyz="0 0 -1" />
+    <limit lower="-1.5708" upper="1.5708" effort="1000" velocity="1000" />
+    <dynamics damping="0.1" friction="0.1" />
+  </joint>
+  <link name="Link5">
+    <inertial>
+      <origin xyz="0.0016612 -0.035686 0.0044302" rpy="0 0 0" />
+      <mass value="0.1131" />
+      <inertia ixx="4.1087E-05" ixy="-6.719E-10" ixz="2.8114E-08" iyy="4.0687E-05" iyz="-7.1084E-06" izz="3.4714E-05" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://dicerox_arm_urdf/meshes/visual/Link5.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://dicerox_arm_urdf/meshes/collision/Link5.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="Joint5" type="revolute">
+    <origin xyz="0 0 -0.345" rpy="1.5708 0 0" />
+    <parent link="Link4" />
+    <child link="Link5" />
+    <axis xyz="0 0 1" />
+    <limit lower="-1.5708" upper="1.5708" effort="1000" velocity="1000" />
+    <dynamics damping="0.1" friction="0.1" />
+  </joint>
+  <link name="Link6">
+    <inertial>
+      <origin xyz="0.00035634 2.3759E-05 0.066312" rpy="0 0 0" />
+      <mass value="0.25036" />
+      <inertia ixx="0.0001021" ixy="-3.1303E-08" ixz="1.6229E-07" iyy="9.1239E-05" iyz="5.6802E-07" izz="5.7902E-05" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://dicerox_arm_urdf/meshes/visual/Link6.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.75294 0.75294 0.75294 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://dicerox_arm_urdf/meshes/collision/Link6.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="Joint6" type="revolute">
+    <origin xyz="0 -0.189 0" rpy="-1.5708 0 0" />
+    <parent link="Link5" />
+    <child link="Link6" />
+    <axis xyz="0 0 -1" />
+    <limit lower="-1.5708" upper="1.5708" effort="1000" velocity="1000" />
+    <dynamics damping="0.1" friction="0.1" />
+  </joint>
+</robot>

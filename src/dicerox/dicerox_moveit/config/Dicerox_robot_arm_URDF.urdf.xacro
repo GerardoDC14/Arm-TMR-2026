@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="Dicerox_robot_arm_URDF">
+    <xacro:arg name="initial_positions_file" default="initial_positions.yaml" />
+    <xacro:arg name="chassis_mount_xyz" default="-0.14 0 -0.14" />
+    <xacro:arg name="chassis_mount_rpy" default="0 0 -1.5708" />
+
+    <!-- Import Dicerox_robot_arm_URDF urdf file -->
+    <xacro:include filename="$(find dicerox_arm_urdf)/urdf/Dicerox_robot_arm_URDF.xacro" />
+    <xacro:include filename="$(find dicerox_urdf_v1)/urdf/Dicerox_URDFv1.xacro" />
+
+    <!-- Import control_xacro -->
+    <xacro:include filename="Dicerox_robot_arm_URDF.ros2_control.xacro" />
+
+    <!-- Mount the chassis below the arm so both subsystems share one robot model in MoveIt/RViz. -->
+    <joint name="world_link_to_chassis_base_link" type="fixed">
+        <origin xyz="$(arg chassis_mount_xyz)" rpy="$(arg chassis_mount_rpy)" />
+        <parent link="world_link" />
+        <child link="chassis_base_link" />
+    </joint>
+
+    <xacro:Dicerox_robot_arm_URDF_ros2_control name="FakeSystem" initial_positions_file="$(arg initial_positions_file)"/>
+
+</robot>
