@@ -45,7 +45,7 @@ Arduino libraries used by the Jaguar ESP32 sketches:
 Both robots now follow the same high-level MoveIt Servo input path:
 
 ```text
-Joystick / Keyboard
+Joystick / Keyboard / SpaceMouse
         │
         └──→ jaguar_teleop
                ├──→ /servo_node/delta_twist_cmds
@@ -87,6 +87,9 @@ ros2 launch jaguar_teleop joystick.launch.py
 
 # 4b. Keyboard teleop + Jaguar serial bridge
 ros2 launch jaguar_teleop keyboard.launch.py
+
+# 4c. SpaceMouse (Space Explorer) — all-in-one: demo + servo + spacemouse node
+ros2 launch jaguar_full spacemouse.launch.py
 ```
 
 If the ESP32 is on a different port:
@@ -128,6 +131,9 @@ ros2 launch dicerox_moveit joystick.launch.py
 
 # 3b. Keyboard teleop
 ros2 launch dicerox_moveit keyboard.launch.py
+
+# 3c. SpaceMouse (Space Explorer) — all-in-one: demo + servo + spacemouse node
+ros2 launch dicerox_moveit spacemouse.launch.py
 ```
 
 ### Dicerox notes
@@ -170,6 +176,35 @@ ros2 launch dicerox_moveit keyboard.launch.py
 | `space` or `x` | Stop |
 | `+` / `-` | Adjust speed |
 
+### Space Explorer 3D mouse
+
+The SpaceMouse controller (`spacemouse_servo`) provides simultaneous 6-DOF Cartesian control of the end effector. All six axes are live at the same time — no mode switching required.
+
+| Puck gesture | Effect |
+|---|---|
+| Push forward / back | EEF +X / -X |
+| Push left / right | EEF +Y / -Y |
+| Push up / down | EEF +Z / -Z |
+| Tilt left / right | Roll (angular X) |
+| Tilt forward / back | Pitch (angular Y) |
+| Twist CW / CCW | Yaw (angular Z) |
+| RIGHT button | Pause / resume MoveIt Servo |
+
+**Axis filtering** — three stages prevent mixed commands caused by physical coupling:
+
+1. **Noise floor** (`deadband=0.05`) — per-axis hard cutoff to eliminate sensor noise at rest.
+2. **Within-group suppression** (`axis_relative_threshold=0.40`) — inside each group (translation or rotation), axes below 40 % of the group peak are zeroed.
+3. **Group dominance** (`dominance_threshold=1.5`) — if one group's magnitude exceeds the other by more than 1.5×, the weaker group is zeroed entirely.
+
+**udev rule** — the Space Explorer ships without world-readable permissions on most distros. Add a rule so any logged-in user can open it:
+
+```bash
+echo 'SUBSYSTEM=="hidraw", ATTRS{idVendor}=="046d", ATTRS{idProduct}=="c627", MODE="0660", GROUP="plugdev"' \
+  | sudo tee /etc/udev/rules.d/99-spacemouse.rules
+sudo udevadm control --reload-rules && sudo udevadm trigger
+sudo usermod -aG plugdev $USER   # log out and back in after this
+```
+
 ## Firmware
 
 - `firmware/servo_sweep/`: Jaguar ESP32 sketch for joints 4-6 and gripper
@@ -182,7 +217,7 @@ ros2 launch dicerox_moveit keyboard.launch.py
 |---------|-------|------|
 | `jaguar_robot_full_description` | Jaguar | Arm URDF, meshes, RViz assets |
 | `jaguar_full` | Jaguar | MoveIt config, controllers, Servo launch |
-| `jaguar_teleop` | Shared | Shared joystick / keyboard MoveIt Servo inputs, plus Jaguar serial bridge |
+| `jaguar_teleop` | Shared | Shared joystick / keyboard / SpaceMouse MoveIt Servo inputs, plus Jaguar serial bridge |
 | `ginkgo_odrive_bridge` | Shared / Jaguar | ODrive CAN bridge for real hardware |
 | `dicerox_arm_urdf` | Dicerox | Arm URDF and meshes |
 | `dicerox_urdf_v1` | Dicerox | Chassis / flipper URDF and meshes |

@@ -27,6 +27,7 @@ setup(
             'keyboard_servo = jaguar_teleop.keyboard_servo:main',
             'joystick_servo = jaguar_teleop.joystick_servo:main',
             'serial_bridge = jaguar_teleop.serial_bridge:main',
+            'spacemouse_servo = jaguar_teleop.spacemouse_servo:main',
         ],
     },
 )
