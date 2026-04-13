@@ -36,7 +36,7 @@ setup(
     packages=find_packages(include=[package_name, f"{package_name}.*"]),
     data_files=data_files,
     scripts=["scripts/cansniffer.py"],
-    install_requires=["setuptools"],
+    install_requires=["setuptools", "pyserial"],
     zip_safe=False,
     maintainer="gerardo",
     maintainer_email="gerardodelcid16@gmail.com",
@@ -51,7 +51,9 @@ setup(
             "lktech_cli_position_test = bldc_can_tools.cli_position_test:main",
             "lktech_can_health_check = bldc_can_tools.cli_can_health_check:main",
             "bldc_ze300_read = bldc_can_tools.cli_ze300_read:main",
+            "moveit_odrive_bridge_3dof = bldc_can_tools.moveit_odrive_bridge_3dof_node:main",
+            "moveit_arm_bridge_4dof = bldc_can_tools.moveit_arm_bridge_4dof_node:main",
+            "moveit_arm_bridge_6dof = bldc_can_tools.moveit_arm_bridge_6dof_node:main",
         ],
     },
 )
-

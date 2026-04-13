@@ -405,10 +405,28 @@ bool sendFrame(uint16_t arbitration_id, const uint8_t *data, uint8_t dlc) {
   return true;
 }
 
-void drainReceiveQueue() {
+void drainReceiveQueue(uint16_t focus_reply_id = 0xFFFF) {
   can_frame frame = {};
+  size_t discarded_count = 0;
+  size_t focused_count = 0;
   while (g_mcp2515.readMessage(&frame) == MCP2515::ERROR_OK) {
-    printFrame(frame, "RX(stale)");
+    const uint16_t arbitration_id = static_cast<uint16_t>(frame.can_id & CAN_SFF_MASK);
+    if (focus_reply_id != 0xFFFF && arbitration_id == focus_reply_id) {
+      ++focused_count;
+      printFrame(frame, "RX(stale-target)");
+    } else {
+      ++discarded_count;
+    }
+  }
+
+  if (discarded_count > 0 || focused_count > 0) {
+    Serial.printf("drained rx queue: discarded=%u focused=%u",
+                  static_cast<unsigned>(discarded_count),
+                  static_cast<unsigned>(focused_count));
+    if (focus_reply_id != 0xFFFF) {
+      Serial.printf(" focus_id=0x%03X", focus_reply_id);
+    }
+    Serial.println();
   }
 }
 
@@ -417,19 +435,25 @@ bool waitForReply(size_t index, uint8_t expected_command, can_frame *reply_frame
   can_frame frame = {};
 
   while (millis() - start_ms < REPLY_TIMEOUT_MS) {
-    if (g_mcp2515.readMessage(&frame) == MCP2515::ERROR_OK) {
-      printFrame(frame, "RX");
+    bool saw_any_frame = false;
+    while (g_mcp2515.readMessage(&frame) == MCP2515::ERROR_OK) {
+      saw_any_frame = true;
       const uint32_t arbitration_id = frame.can_id & CAN_SFF_MASK;
-      if (arbitration_id == replyId(index) &&
-          frame.can_dlc >= 1 &&
-          frame.data[0] == expected_command) {
+      const bool matching_reply = arbitration_id == replyId(index) &&
+                                  frame.can_dlc >= 1 &&
+                                  frame.data[0] == expected_command;
+      if (matching_reply) {
+        printFrame(frame, "RX");
         if (reply_frame != nullptr) {
           *reply_frame = frame;
         }
         return true;
       }
     }
-    delay(2);
+
+    if (!saw_any_frame) {
+      delay(2);
+    }
   }
 
   Serial.printf("timeout waiting for reply cmd=0x%02X on id=0x%03X (%s)\n",
@@ -440,7 +464,7 @@ bool waitForReply(size_t index, uint8_t expected_command, can_frame *reply_frame
 }
 
 bool sendSimpleCommandAndWait(size_t index, uint8_t command, can_frame *reply_frame = nullptr) {
-  drainReceiveQueue();
+  drainReceiveQueue(replyId(index));
   const uint8_t payload_lk[8] = {command, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
   const uint8_t payload_ze[1] = {command};
 
@@ -457,7 +481,7 @@ bool sendSimpleCommandAndWait(size_t index, uint8_t command, can_frame *reply_fr
 }
 
 bool sendValueCommandAndWait(size_t index, uint8_t command, int32_t value, can_frame *reply_frame = nullptr) {
-  drainReceiveQueue();
+  drainReceiveQueue(replyId(index));
   uint8_t payload[8] = {
       command,
       static_cast<uint8_t>(value & 0xFF),

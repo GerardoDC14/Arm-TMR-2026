@@ -19,7 +19,7 @@ struct MixedMotorConfig {
   bool ze300_tagged_requests;
 };
 
-static constexpr CAN_SPEED kMixedCanSpeed = CAN_1000KBPS;
+static constexpr CAN_SPEED kMixedCanSpeed = CAN_500KBPS;
 static constexpr CAN_CLOCK kMixedCanClock = MCP_8MHZ;
 
 static constexpr uint16_t kLKTechStdIdBase = 0x140;

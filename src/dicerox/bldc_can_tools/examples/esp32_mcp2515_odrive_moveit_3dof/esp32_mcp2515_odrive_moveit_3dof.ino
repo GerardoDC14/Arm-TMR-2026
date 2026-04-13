@@ -42,6 +42,8 @@ void serviceTargetStreaming();
 void serviceBackgroundBringup();
 void serviceSafetyFailsafes();
 void printHexByte(uint8_t value);
+bool sendRelativePositionDegreesToNode(uint8_t nodeId, float relativeDegrees, bool printSummary, bool logCanFrame);
+bool handleMoveItTripletCommand(const char *line);
 bool ensureActiveNodeReadyForMotion(const char *reason);
 void runAutomaticBringupAllNodes();
 void clearActiveTargetForNode(uint8_t nodeId, const char *reason);
@@ -661,6 +663,126 @@ void sendRelativePositionDegrees(float relativeDegrees) {
   sendInputPosition(absoluteTurns);
 }
 
+bool sendRelativePositionDegreesToNode(uint8_t nodeId,
+                                       float relativeDegrees,
+                                       bool printSummary,
+                                       bool logCanFrame) {
+  const uint8_t previousActiveNodeId = g_activeNodeId;
+  g_activeNodeId = nodeId;
+  NodeRuntimeState &state = selectedNodeState();
+
+  if (!ensureActiveNodeReadyForMotion("moveit command")) {
+    if (printSummary) {
+      Serial.print("Cannot send relative angle for node 0x");
+      printHexByte(nodeId);
+      Serial.println(": automatic bringup did not complete.");
+    }
+    g_activeNodeId = previousActiveNodeId;
+    return false;
+  }
+
+  if (!jointDegreesWithinLimits(g_activeNodeId, relativeDegrees)) {
+    if (printSummary) {
+      Serial.print("Rejected angle command for node 0x");
+      printHexByte(nodeId);
+      Serial.print(": ");
+      Serial.print(relativeDegrees, 3);
+      Serial.print(" deg is outside limits [");
+      Serial.print(nodeMinJointDegrees(g_activeNodeId), 1);
+      Serial.print(", ");
+      Serial.print(nodeMaxJointDegrees(g_activeNodeId), 1);
+      Serial.println("]");
+    }
+    g_activeNodeId = previousActiveNodeId;
+    return false;
+  }
+
+  const float relativeTurns = jointDegreesToMotorTurns(g_activeNodeId, relativeDegrees);
+  const float absoluteTurns = state.zeroReferenceTurns + relativeTurns;
+
+  state.haveActiveTarget = true;
+  state.lastRelativeCommandTurns = relativeTurns;
+  state.lastRelativeCommandDegrees = relativeDegrees;
+  state.lastAbsoluteCommandTurns = absoluteTurns;
+  state.lastTargetStreamMs = millis();
+
+  if (printSummary) {
+    Serial.print("Relative target node=0x");
+    printHexByte(nodeId);
+    Serial.print(" deg=");
+    Serial.print(relativeDegrees, 3);
+    Serial.print(" -> motor_delta=");
+    Serial.print(relativeTurns, 6);
+    Serial.print(" turns -> absolute target=");
+    Serial.print(absoluteTurns, 6);
+    Serial.println(" turns");
+  }
+
+  sendInputPositionToNode(nodeId, absoluteTurns, 0, 0, printSummary ? "Sent Set_Input_Pos" : nullptr, logCanFrame);
+  g_activeNodeId = previousActiveNodeId;
+  return true;
+}
+
+bool handleMoveItTripletCommand(const char *line) {
+  if (line == nullptr) {
+    return false;
+  }
+
+  if (!(strncmp(line, "j ", 2) == 0 || strncmp(line, "js ", 3) == 0)) {
+    return false;
+  }
+
+  const char *valueText = line + (line[1] == 's' ? 3 : 2);
+  char buffer[SERIAL_LINE_BUFFER_SIZE] = {};
+  strncpy(buffer, valueText, sizeof(buffer) - 1);
+
+  char *savePtr = nullptr;
+  char *token1 = strtok_r(buffer, " \t", &savePtr);
+  char *token2 = strtok_r(nullptr, " \t", &savePtr);
+  char *token3 = strtok_r(nullptr, " \t", &savePtr);
+  char *token4 = strtok_r(nullptr, " \t", &savePtr);
+
+  if (token1 == nullptr || token2 == nullptr || token3 == nullptr || token4 != nullptr) {
+    Serial.println("Usage: j <joint1_deg> <joint2_deg> <joint3_deg>");
+    return true;
+  }
+
+  char *end1 = nullptr;
+  char *end2 = nullptr;
+  char *end3 = nullptr;
+  const float joint1Deg = strtof(token1, &end1);
+  const float joint2Deg = strtof(token2, &end2);
+  const float joint3Deg = strtof(token3, &end3);
+  if (end1 == token1 || *end1 != '\0' ||
+      end2 == token2 || *end2 != '\0' ||
+      end3 == token3 || *end3 != '\0') {
+    Serial.println("Invalid joint triplet. Example: j 10.0 20.0 -15.0");
+    return true;
+  }
+
+  const bool ok1 = sendRelativePositionDegreesToNode(NODE_ID_10, joint1Deg, false, false);
+  const bool ok2 = sendRelativePositionDegreesToNode(NODE_ID_11, joint2Deg, false, false);
+  const bool ok3 = sendRelativePositionDegreesToNode(NODE_ID_12, joint3Deg, false, false);
+
+  if (!(ok1 && ok2 && ok3)) {
+    Serial.print("MoveIt triplet partially applied: joint1=");
+    Serial.print(ok1 ? "ok" : "fail");
+    Serial.print(" joint2=");
+    Serial.print(ok2 ? "ok" : "fail");
+    Serial.print(" joint3=");
+    Serial.println(ok3 ? "ok" : "fail");
+    return true;
+  }
+
+  Serial.print("MoveIt triplet applied: joint1=");
+  Serial.print(joint1Deg, 3);
+  Serial.print(" joint2=");
+  Serial.print(joint2Deg, 3);
+  Serial.print(" joint3=");
+  Serial.println(joint3Deg, 3);
+  return true;
+}
+
 void printMotionState() {
   const NodeRuntimeState &state = selectedNodeState();
   const float relativeTurnsFromZero = state.lastEncoderPosTurns - state.zeroReferenceTurns;
@@ -767,6 +889,7 @@ void printHelp() {
   Serial.println("  u      : print boot configuration summary");
   Serial.println("  f      : print failsafe-aware status for all nodes");
   Serial.println("  g <n>  : send relative joint angle in degrees from zero");
+  Serial.println("  j a b c: set joints 1-3 together in degrees (MoveIt bridge)");
   Serial.println("  t <n>  : send relative motor turns from zero (debug)");
   Serial.println("  k      : toggle 20 Hz resend of last Set_Input_Pos");
   Serial.println("  w      : normal one-shot mode");
@@ -1170,6 +1293,10 @@ void handleLineCommand(const char *line) {
     return;
   }
 
+  if (handleMoveItTripletCommand(line)) {
+    return;
+  }
+
   const bool isTurnCommand = line[0] == 't';
   const bool isDegreeShortCommand = line[0] == 'g';
   const bool isDegreeWordCommand =
@@ -1275,7 +1402,7 @@ void setup() {
   pinMode(PIN_CAN_INT, INPUT_PULLUP);
   SPI.begin(PIN_CAN_SCK, PIN_CAN_MISO, PIN_CAN_MOSI, PIN_CAN_CS);
 
-  Serial.println("ESP32 + MCP2515 ODrive CAN controller (3-DOF)");
+  Serial.println("ESP32 + MCP2515 ODrive MoveIt controller (3-DOF)");
   Serial.println("Supported nodes: 0x10, 0x11, 0x12");
   Serial.print("Default active node: 0x12, bitrate: ");
   Serial.print(bitrateName(g_bitrate));
@@ -1307,7 +1434,7 @@ void loop() {
       continue;
     }
 
-    const bool beginsLineCommand = (c == 't' || c == 'g' || c == 'd');
+    const bool beginsLineCommand = (c == 't' || c == 'g' || c == 'd' || c == 'j');
     if (g_serialLineLen == 0 && !beginsLineCommand) {
       switch (c) {
         case 'h':

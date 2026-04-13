@@ -1,0 +1,429 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+import math
+from pathlib import Path
+import sys
+from typing import Optional
+
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+
+try:
+    import rclpy
+    from rclpy.node import Node
+    from rclpy.qos import DurabilityPolicy
+    from rclpy.qos import HistoryPolicy
+    from rclpy.qos import QoSProfile
+    from rclpy.qos import ReliabilityPolicy
+    from sensor_msgs.msg import JointState
+except ImportError as exc:  # pragma: no cover - optional in direct usage
+    rclpy = None
+    Node = object  # type: ignore[assignment]
+    QoSProfile = None  # type: ignore[assignment]
+    ReliabilityPolicy = None  # type: ignore[assignment]
+    HistoryPolicy = None  # type: ignore[assignment]
+    DurabilityPolicy = None  # type: ignore[assignment]
+    JointState = None  # type: ignore[assignment]
+    _ROS_IMPORT_ERROR = exc
+else:
+    _ROS_IMPORT_ERROR = None
+
+
+try:
+    import serial
+    from serial import Serial
+    from serial import SerialException
+except ImportError as exc:  # pragma: no cover - optional in direct usage
+    serial = None  # type: ignore[assignment]
+    Serial = object  # type: ignore[assignment]
+    SerialException = Exception  # type: ignore[assignment]
+    _SERIAL_IMPORT_ERROR = exc
+else:
+    _SERIAL_IMPORT_ERROR = None
+
+
+@dataclass(frozen=True)
+class JointMapping:
+    moveit_name: str
+    min_deg: float
+    max_deg: float
+    sign: float
+
+    def moveit_rad_to_physical_deg(self, radians_value: float) -> float:
+        return self.sign * math.degrees(radians_value)
+
+
+JOINT_MAPPINGS: tuple[JointMapping, ...] = (
+    JointMapping("Joint1", -90.0, 90.0, -1.0),
+    JointMapping("Joint2", 0.0, 180.0, -1.0),
+    JointMapping("Joint3", -200.0, 0.0, -1.0),
+    JointMapping("Joint4", -90.0, 90.0, -1.0),
+    JointMapping("Joint5", -90.0, 90.0, 1.0),
+    JointMapping("Joint6", -90.0, 90.0, 1.0),
+)
+
+
+class MoveItArmBridge6DofNode(Node):  # type: ignore[misc]
+    def __init__(self) -> None:
+        if rclpy is None:
+            raise RuntimeError(f"ROS 2 imports are unavailable: {_ROS_IMPORT_ERROR}")
+        if serial is None:
+            raise RuntimeError(f"pyserial is unavailable: {_SERIAL_IMPORT_ERROR}")
+
+        super().__init__("moveit_arm_bridge_6dof")
+
+        self.declare_parameter("serial_port", "/dev/ttyUSB0")
+        self.declare_parameter("baud_rate", 115200)
+        self.declare_parameter("command_rate_hz", 20.0)
+        self.declare_parameter("min_delta_deg", 0.2)
+        self.declare_parameter("joint_state_timeout_sec", 3.0)
+        self.declare_parameter("idle_on_stale", False)
+        self.declare_parameter("max_command_velocity_dps", 90.0)
+        self.declare_parameter("max_command_acceleration_dps2", 220.0)
+        self.declare_parameter("joint4_offset_deg", 0.0)
+        self.declare_parameter("write_timeout_sec", 0.25)
+        self.declare_parameter("startup_delay_sec", 3.0)
+        self.declare_parameter("joint_state_topic", "/joint_states")
+
+        self.serial_port = str(self.get_parameter("serial_port").value)
+        self.baud_rate = int(self.get_parameter("baud_rate").value)
+        self.command_rate_hz = float(self.get_parameter("command_rate_hz").value)
+        self.min_delta_deg = float(self.get_parameter("min_delta_deg").value)
+        self.joint_state_timeout_sec = float(self.get_parameter("joint_state_timeout_sec").value)
+        self.idle_on_stale = bool(self.get_parameter("idle_on_stale").value)
+        self.max_command_velocity_dps = float(self.get_parameter("max_command_velocity_dps").value)
+        self.max_command_acceleration_dps2 = float(
+            self.get_parameter("max_command_acceleration_dps2").value
+        )
+        self.joint4_offset_deg = float(self.get_parameter("joint4_offset_deg").value)
+        self.write_timeout_sec = float(self.get_parameter("write_timeout_sec").value)
+        self.startup_delay_sec = float(self.get_parameter("startup_delay_sec").value)
+        self.joint_state_topic = str(self.get_parameter("joint_state_topic").value)
+
+        if self.command_rate_hz <= 0.0:
+            raise ValueError("command_rate_hz must be > 0")
+        if self.max_command_velocity_dps <= 0.0:
+            raise ValueError("max_command_velocity_dps must be > 0")
+        if self.max_command_acceleration_dps2 <= 0.0:
+            raise ValueError("max_command_acceleration_dps2 must be > 0")
+
+        self._serial: Optional[Serial] = None
+        self._latest_deg_by_joint: dict[str, float] = {}
+        self._commanded_deg_by_joint: dict[str, float] = {}
+        self._command_velocity_dps_by_joint: dict[str, float] = {}
+        self._last_sent_deg_by_joint: dict[str, float] = {}
+        self._last_joint_state_time = self.get_clock().now()
+        self._startup_ready_time = self.get_clock().now().nanoseconds / 1e9 + self.startup_delay_sec
+        self._last_publish_time_sec = self.get_clock().now().nanoseconds / 1e9
+        self._timeout_warned = False
+        self._joint_state_timeout_disarmed = False
+        self._serial_read_buf = b""
+
+        self._open_serial_port()
+
+        joint_state_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+
+        self.create_subscription(
+            JointState,
+            self.joint_state_topic,
+            self._on_joint_state,
+            joint_state_qos,
+        )
+        self.create_timer(1.0 / self.command_rate_hz, self._publish_latest_targets)
+
+        summary = ", ".join(
+            f"{mapping.moveit_name}[{mapping.min_deg:.0f},{mapping.max_deg:.0f}]"
+            for mapping in JOINT_MAPPINGS
+        )
+        self.get_logger().info(
+            f"Bridging {self.joint_state_topic} to {self.serial_port} at {self.baud_rate} baud; "
+            f"mappings: {summary}; startup_delay={self.startup_delay_sec:.1f}s; "
+            f"idle_on_stale={self.idle_on_stale}; max_command_velocity_dps={self.max_command_velocity_dps:.1f}; "
+            f"max_command_acceleration_dps2={self.max_command_acceleration_dps2:.1f}; "
+            f"joint4_offset_deg={self.joint4_offset_deg:.2f}"
+        )
+
+    def _open_serial_port(self) -> None:
+        try:
+            self._serial = serial.Serial(
+                port=self.serial_port,
+                baudrate=self.baud_rate,
+                timeout=0.0,
+                write_timeout=self.write_timeout_sec,
+            )
+            self._serial_read_buf = b""
+        except SerialException as exc:
+            raise RuntimeError(f"Failed to open serial port {self.serial_port}: {exc}") from exc
+
+    def _reopen_serial_port(self) -> bool:
+        """Attempt to close and reopen the serial port after a write/read failure."""
+        try:
+            if self._serial is not None:
+                try:
+                    self._serial.close()
+                except Exception:
+                    pass
+            self._serial = serial.Serial(
+                port=self.serial_port,
+                baudrate=self.baud_rate,
+                timeout=0.0,
+                write_timeout=self.write_timeout_sec,
+            )
+            self._serial_read_buf = b""
+            # Reset motion state so the arm is re-commanded from scratch after
+            # reconnect rather than assuming the previous positions still hold.
+            self._commanded_deg_by_joint.clear()
+            self._command_velocity_dps_by_joint.clear()
+            self._last_sent_deg_by_joint.clear()
+            self.get_logger().info(f"Reopened serial port {self.serial_port}")
+            return True
+        except SerialException as exc:
+            self.get_logger().warn(
+                f"Failed to reopen {self.serial_port}: {exc}",
+                throttle_duration_sec=5.0,
+            )
+            return False
+
+    def _on_joint_state(self, msg: JointState) -> None:
+        positions_by_name = {
+            name: position
+            for name, position in zip(msg.name, msg.position)
+        }
+
+        for mapping in JOINT_MAPPINGS:
+            radians_value = positions_by_name.get(mapping.moveit_name)
+            if radians_value is None or not math.isfinite(radians_value):
+                continue
+
+            physical_deg = mapping.moveit_rad_to_physical_deg(radians_value)
+            if mapping.moveit_name == "Joint4":
+                physical_deg += self.joint4_offset_deg
+            if physical_deg < mapping.min_deg or physical_deg > mapping.max_deg:
+                self.get_logger().warn(
+                    f"{mapping.moveit_name} target {physical_deg:.2f} deg is outside physical limits "
+                    f"[{mapping.min_deg:.1f}, {mapping.max_deg:.1f}]; clamping",
+                    throttle_duration_sec=2.0,
+                )
+                physical_deg = min(max(physical_deg, mapping.min_deg), mapping.max_deg)
+
+            self._latest_deg_by_joint[mapping.moveit_name] = physical_deg
+
+        self._last_joint_state_time = self.get_clock().now()
+        self._timeout_warned = False
+        self._joint_state_timeout_disarmed = False
+
+    def _drain_serial_input(self) -> None:
+        """Read and parse any pending bytes from the ESP32 serial output.
+
+        The ESP32 continuously emits status and error lines.  If we never read
+        them the OS receive buffer (~4 KB) eventually fills, which can stall the
+        write side.  We drain whatever is available without blocking, split on
+        newlines, and surface WARN/ERROR keywords to the ROS logger.
+        """
+        if self._serial is None or not self._serial.is_open:
+            return
+
+        try:
+            waiting = self._serial.in_waiting
+            if waiting > 0:
+                self._serial_read_buf += self._serial.read(waiting)
+        except SerialException as exc:
+            self.get_logger().warn(f"Serial read error: {exc}", throttle_duration_sec=5.0)
+            return
+
+        while b"\n" in self._serial_read_buf:
+            line_bytes, self._serial_read_buf = self._serial_read_buf.split(b"\n", 1)
+            try:
+                line = line_bytes.decode("ascii", errors="replace").strip()
+            except Exception:
+                continue
+
+            if not line:
+                continue
+
+            upper = line.upper()
+            if "FAILSAFE" in upper or "BUS-OFF" in upper or "ERROR_FAILTX" in upper:
+                self.get_logger().error(f"ESP32: {line}", throttle_duration_sec=1.0)
+            elif (
+                "FAILED" in upper
+                or "WARNING" in upper
+                or "WARN" in upper
+                or "PARTIALLY APPLIED" in upper
+                or "TIMEOUT" in upper
+            ):
+                self.get_logger().warn(f"ESP32: {line}", throttle_duration_sec=1.0)
+            else:
+                self.get_logger().debug(f"ESP32: {line}")
+
+        # Guard against a pathologically long line with no newline filling the
+        # buffer (e.g. garbled UART).  Drop anything beyond 1 KB.
+        if len(self._serial_read_buf) > 1024:
+            self.get_logger().warn(
+                "Serial read buffer overflowed (no newline in 1 KB); discarding",
+                throttle_duration_sec=10.0,
+            )
+            self._serial_read_buf = b""
+
+    def _publish_latest_targets(self) -> None:
+        self._drain_serial_input()
+
+        now_sec = self.get_clock().now().nanoseconds / 1e9
+        dt_sec = max(now_sec - self._last_publish_time_sec, 1e-3)
+        self._last_publish_time_sec = now_sec
+
+        if now_sec < self._startup_ready_time:
+            return
+
+        age_sec = (self.get_clock().now() - self._last_joint_state_time).nanoseconds / 1e9
+        if age_sec > self.joint_state_timeout_sec:
+            if not self._timeout_warned:
+                action = "sending idle command" if self.idle_on_stale else "holding last targets"
+                self.get_logger().warn(f"No fresh joint_states for {age_sec:.2f}s; {action}")
+                self._timeout_warned = True
+            if self.idle_on_stale and not self._joint_state_timeout_disarmed:
+                self._send_idle_to_all_joints()
+                self._joint_state_timeout_disarmed = True
+            return
+
+        commanded_deg_sextet: list[float] = []
+        next_velocity_dps_by_joint: dict[str, float] = {}
+        any_change = False
+
+        for mapping in JOINT_MAPPINGS:
+            target_deg = self._latest_deg_by_joint.get(mapping.moveit_name)
+            if target_deg is None:
+                return
+
+            current_deg = self._commanded_deg_by_joint.get(mapping.moveit_name, 0.0)
+            current_vel = self._command_velocity_dps_by_joint.get(mapping.moveit_name, 0.0)
+            next_deg, next_vel = self._step_motion_toward_target(
+                current_deg,
+                current_vel,
+                target_deg,
+                dt_sec,
+            )
+            commanded_deg_sextet.append(next_deg)
+            next_velocity_dps_by_joint[mapping.moveit_name] = next_vel
+
+            last_sent_deg = self._last_sent_deg_by_joint.get(mapping.moveit_name)
+            if last_sent_deg is None or abs(next_deg - last_sent_deg) >= self.min_delta_deg:
+                any_change = True
+
+        if not any_change:
+            self._command_velocity_dps_by_joint.update(next_velocity_dps_by_joint)
+            self._commanded_deg_by_joint.update(
+                {
+                    mapping.moveit_name: target_deg
+                    for mapping, target_deg in zip(JOINT_MAPPINGS, commanded_deg_sextet)
+                }
+            )
+            return
+
+        if not self._send_joint_sextet(commanded_deg_sextet):
+            return
+
+        for mapping, target_deg in zip(JOINT_MAPPINGS, commanded_deg_sextet):
+            self._commanded_deg_by_joint[mapping.moveit_name] = target_deg
+            self._command_velocity_dps_by_joint[mapping.moveit_name] = next_velocity_dps_by_joint[
+                mapping.moveit_name
+            ]
+            self._last_sent_deg_by_joint[mapping.moveit_name] = target_deg
+
+    def _step_motion_toward_target(
+        self,
+        current_deg: float,
+        current_vel_dps: float,
+        target_deg: float,
+        dt_sec: float,
+    ) -> tuple[float, float]:
+        error_deg = target_deg - current_deg
+        if abs(error_deg) <= 1e-4 and abs(current_vel_dps) <= 1e-4:
+            return target_deg, 0.0
+
+        accel = self.max_command_acceleration_dps2
+        max_vel = self.max_command_velocity_dps
+        direction = 1.0 if error_deg >= 0.0 else -1.0
+
+        stopping_speed = math.sqrt(max(0.0, 2.0 * accel * abs(error_deg)))
+        desired_vel_dps = direction * min(max_vel, stopping_speed)
+
+        max_vel_change = accel * dt_sec
+        if desired_vel_dps > current_vel_dps:
+            next_vel_dps = min(desired_vel_dps, current_vel_dps + max_vel_change)
+        else:
+            next_vel_dps = max(desired_vel_dps, current_vel_dps - max_vel_change)
+
+        next_deg = current_deg + next_vel_dps * dt_sec
+
+        remaining_after_step = target_deg - next_deg
+        if error_deg == 0.0 or error_deg * remaining_after_step <= 0.0:
+            return target_deg, 0.0
+
+        if abs(remaining_after_step) < self.min_delta_deg * 0.5 and abs(next_vel_dps) < accel * dt_sec:
+            return target_deg, 0.0
+
+        return next_deg, next_vel_dps
+
+    def _send_joint_sextet(self, command_deg_sextet: list[float]) -> bool:
+        if self._serial is None or not self._serial.is_open:
+            self.get_logger().warn("Serial port not open; attempting reconnect", throttle_duration_sec=5.0)
+            if not self._reopen_serial_port():
+                return False
+
+        try:
+            command_line = "j6 " + " ".join(f"{target_deg:.3f}" for target_deg in command_deg_sextet) + "\n"
+            self._serial.write(command_line.encode("ascii"))  # type: ignore[union-attr]
+            self._serial.flush()  # type: ignore[union-attr]
+        except SerialException as exc:
+            self.get_logger().error(f"Failed to write MoveIt sextet: {exc}")
+            self._reopen_serial_port()
+            return False
+
+        summary = ", ".join(
+            f"{mapping.moveit_name}={target_deg:.2f}"
+            for mapping, target_deg in zip(JOINT_MAPPINGS, command_deg_sextet)
+        )
+        self.get_logger().info(f"MoveIt sextet sent: {summary}", throttle_duration_sec=0.5)
+        return True
+
+    def _send_idle_to_all_joints(self) -> None:
+        if self._serial is None or not self._serial.is_open:
+            return
+
+        try:
+            self._serial.write(b"jx6\n")
+            self._serial.flush()
+        except SerialException as exc:
+            self.get_logger().error(f"Failed to send jx6 idle command: {exc}")
+            self._reopen_serial_port()
+            return
+
+        self._commanded_deg_by_joint.clear()
+        self._command_velocity_dps_by_joint.clear()
+        self._last_sent_deg_by_joint.clear()
+
+    def destroy_node(self) -> bool:
+        if self._serial is not None and self._serial.is_open:
+            self._serial.close()
+        return super().destroy_node()
+
+
+def main(argv: list[str] | None = None) -> None:
+    if rclpy is None:
+        raise RuntimeError(f"ROS 2 imports are unavailable: {_ROS_IMPORT_ERROR}")
+
+    rclpy.init(args=argv)
+    node = MoveItArmBridge6DofNode()
+    try:
+        rclpy.spin(node)
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()

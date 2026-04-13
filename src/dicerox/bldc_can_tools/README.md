@@ -160,6 +160,102 @@ Send one target:
 python -m bldc_can_tools.cli_position_test --help
 ```
 
+## MoveIt `/joint_states` To ODrive 3-DOF Bridge
+
+For the dedicated MoveIt-to-ODrive path for joints `1-3`, upload:
+
+- `src/dicerox/bldc_can_tools/examples/esp32_mcp2515_odrive_moveit_3dof/esp32_mcp2515_odrive_moveit_3dof.ino`
+
+Then run:
+
+```bash
+ros2 run bldc_can_tools moveit_odrive_bridge_3dof --ros-args \
+  -p serial_port:=/dev/ttyUSB0 \
+  -p baud_rate:=115200 \
+  -p command_rate_hz:=15.0 \
+  -p min_delta_deg:=0.25 \
+  -p joint_state_timeout_sec:=3.0 \
+  -p idle_on_stale:=false \
+  -p max_command_velocity_dps:=90.0
+```
+
+What it does:
+
+- subscribes to `/joint_states`
+- reads `Joint1`, `Joint2`, and `Joint3`
+- converts radians to physical degrees with `physical_deg = -degrees(moveit_rad)`
+- applies the physical limits already used by the ODrive controller:
+  `Joint1 -> [-90, 90]`, `Joint2 -> [0, 180]`, `Joint3 -> [-200, 0]`
+- sends one synchronized serial command for all three joints together
+- applies a bridge-side slew limit so MoveIt updates become smoother ODrive targets
+- uses a reliable `/joint_states` subscription to reduce dropped commands
+- holds the last target by default if `/joint_states` goes stale; set `idle_on_stale:=true` if you want stale input to force `IDLE`
+
+## MoveIt `/joint_states` To 4-DOF Arm Bridge
+
+For the combined ODrive + ZE300 path for joints `1-4`, upload:
+
+- `src/dicerox/bldc_can_tools/examples/esp32_mcp2515_moveit_4dof/esp32_mcp2515_moveit_4dof.ino`
+
+Then run:
+
+```bash
+ros2 run bldc_can_tools moveit_arm_bridge_4dof --ros-args \
+  -p serial_port:=/dev/ttyUSB0 \
+  -p baud_rate:=115200 \
+  -p command_rate_hz:=15.0 \
+  -p min_delta_deg:=0.25 \
+  -p joint_state_timeout_sec:=3.0 \
+  -p idle_on_stale:=false \
+  -p max_command_velocity_dps:=90.0 \
+  -p joint4_offset_deg:=0.0
+```
+
+What it does:
+
+- subscribes to `/joint_states`
+- reads `Joint1`, `Joint2`, `Joint3`, and `Joint4`
+- converts radians to physical degrees with `physical_deg = -degrees(moveit_rad)`
+- applies limits:
+  `Joint1 -> [-90, 90]`, `Joint2 -> [0, 180]`, `Joint3 -> [-200, 0]`, `Joint4 -> [-90, 90]`
+- sends one synchronized `j4 ...` command for all four joints
+- uses `jx` if stale input should idle all four joints together
+- keeps the ODrive smoothing / hold-last-target behavior and adds ZE300 joint4 on top
+- `joint4_offset_deg` lets you shift joint4 if the ZE300 absolute zero does not match MoveIt zero exactly
+
+## MoveIt `/joint_states` To 6-DOF Arm Bridge
+
+For the combined ODrive + ZE300 + LKTech path for joints `1-6`, upload:
+
+- `src/dicerox/bldc_can_tools/examples/esp32_mcp2515_moveit_6dof/esp32_mcp2515_moveit_6dof.ino`
+
+Then run:
+
+```bash
+ros2 run bldc_can_tools moveit_arm_bridge_6dof --ros-args \
+  -p serial_port:=/dev/ttyUSB0 \
+  -p baud_rate:=115200 \
+  -p command_rate_hz:=20.0 \
+  -p min_delta_deg:=0.2 \
+  -p joint_state_timeout_sec:=3.0 \
+  -p idle_on_stale:=false \
+  -p max_command_velocity_dps:=90.0 \
+  -p max_command_acceleration_dps2:=220.0 \
+  -p joint4_offset_deg:=0.0
+```
+
+What it does:
+
+- subscribes to `/joint_states`
+- reads `Joint1` through `Joint6`
+- converts radians to physical degrees with these mappings:
+  `Joint1 -> -degrees(rad)`, `Joint2 -> -degrees(rad)`, `Joint3 -> -degrees(rad)`, `Joint4 -> -degrees(rad)`, `Joint5 -> degrees(rad)`, `Joint6 -> degrees(rad)`
+- applies limits:
+  `Joint1 -> [-90, 90]`, `Joint2 -> [0, 180]`, `Joint3 -> [-200, 0]`, `Joint4 -> [-90, 90]`, `Joint5 -> [-90, 90]`, `Joint6 -> [-90, 90]`
+- sends one synchronized `j6 ...` command for all six joints
+- uses an acceleration-limited bridge profile plus ESP32-side target re-streaming to reduce stop-go motion
+- auto-initializes joint4 speed and auto-captures joint5/joint6 zero on boot
+
 ## Run `cansniffer.py`
 
 Directly from the package root:
@@ -191,7 +287,8 @@ What it does:
 - reuses the same ESP32 SPI wiring pattern as the other MCP2515 examples in this repo
 - supports node IDs `0x10`, `0x11`, and `0x12`
 - selects one node at a time for interactive commands while keeping per-node runtime state
-- uses a fixed CAN bitrate of `1 Mbps`
+- enforces per-joint relative-angle safety limits before sending motion commands
+- supports runtime CAN bitrate switching between `500 kbps` and `1 Mbps`
 - uses the same `48:1` gear ratio and `-1.0` direction convention as the Ginkgo bridge
 - decodes the most useful ODrive messages for step-by-step debugging:
   heartbeat, `Get_Error`, `Set_Axis_State`, `Get_Encoder_Estimates`, and `Set_Input_Pos`
@@ -202,13 +299,13 @@ Default wiring:
 - `GPIO19 -> SO`
 - `GPIO18 -> SCK`
 - `GPIO5 -> CS`
-- `GPIO4 -> INT`
+- `GPIO4 -> INT` (optional; the sketch also polls RX directly)
 
 Default CAN setup:
 
 - bitrate: `1 Mbps`
 - MCP2515 oscillator: `8 MHz`
-- mode: `normal`
+- mode: `normal one-shot`
 - default active node ID: `0x12`
 
 Useful serial commands at `115200`:
@@ -224,10 +321,16 @@ Useful serial commands at `115200`:
 - `z` captures the current encoder estimate as zero and holds that position
 - `g <degrees>` sends a relative joint-angle target from the captured zero
 - `t <turns>` sends a relative motor-turn target from zero for low-level debugging
+- both `g` and `t` are checked against the per-node joint-angle limits
 - `o` prints the cached motion / heartbeat / error state
+- `u` prints a per-node boot-configuration summary
+- `f` prints the per-node failsafe / boot summary
 - `k` toggles the 20 Hz resend of the last `Set_Input_Pos`
 - `v` toggles throttled encoder telemetry
 - `a` toggles raw RX debug
+- `w` switches to `normal one-shot` mode so missing ACKs do not wedge the TX buffers
+- `5` switches the CAN bitrate to `500 kbps`
+- `m` switches the CAN bitrate to `1 Mbps`
 - `n`, `i`, `l` switch mode between normal, listen-only, and loopback
 - `8` or `6` switch the MCP2515 oscillator assumption between `8 MHz` and `16 MHz`
 
@@ -239,6 +342,9 @@ Default runtime behavior:
 - encoder telemetry printing is off unless `v` is enabled
 - the sketch automatically attempts bringup for `0x10`, `0x11`, and `0x12` on startup
 - bringup automatically retries up to 3 times per node
+- if one or more nodes miss the first pass, the sketch keeps retrying them in the background until they have a captured zero
+- if a node loses heartbeat, loses encoder updates, leaves closed loop, or reports an ODrive fault/disarm, the sketch latches a failsafe, drops its target stream, and invalidates its zero until it is brought up again
+- default joint limits are `0x10: [-90, 90] deg`, `0x11: [0, 180] deg`, and `0x12: [-180, 0] deg`
 - if you send `g <degrees>` or `t <turns>` and the selected node is not ready, the sketch auto-brings it up first
 - the last position target is resent at `20 Hz` by default to behave more like the Ginkgo bridge
 - each node keeps its own cached zero / target / heartbeat state when you switch motors
@@ -278,6 +384,8 @@ Bus-level debug:
 
 - `a` turns on passthrough mode and prints every standard frame the MCP2515 receives
 - this is the quickest way to confirm whether the ESP32 sees any real bus traffic at all
+- if TX fails, compare the working bus settings first: `5` or `m` for bitrate, then `8` or `6` for oscillator
+- when a background `Set_Input_Pos` stream fails, the sketch now pauses streaming for that node and reconfigures the MCP2515 so one stale target does not wedge the whole session
 
 Important note:
 

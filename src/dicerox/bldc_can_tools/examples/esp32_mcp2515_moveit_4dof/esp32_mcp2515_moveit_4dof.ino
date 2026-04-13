@@ -14,10 +14,14 @@
 
 #include "odrive_can_support.h"
 #include "odrive_can_state.h"
+#include "ze300_joint4.h"
 
 namespace {
 
 using namespace odrive_can_sniffer;
+
+constexpr float JOINT4_MIN_DEG = -90.0f;
+constexpr float JOINT4_MAX_DEG = 90.0f;
 
 MCP2515 canController(PIN_CAN_CS);
 struct can_frame rxFrame;
@@ -36,12 +40,17 @@ unsigned long g_lastSerialActivityMs = 0;
 NodeRuntimeState g_nodeStates[SUPPORTED_NODE_COUNT];
 char g_serialLine[SERIAL_LINE_BUFFER_SIZE] = {};
 size_t g_serialLineLen = 0;
+ze300_joint4::State g_joint4State;
 
 void processIncomingFrames();
 void serviceTargetStreaming();
 void serviceBackgroundBringup();
 void serviceSafetyFailsafes();
 void printHexByte(uint8_t value);
+bool sendRelativePositionDegreesToNode(uint8_t nodeId, float relativeDegrees, bool printSummary, bool logCanFrame);
+bool sendJoint4AbsoluteDegrees(float absoluteDegrees, bool printSummary);
+bool handleMoveItBridgeCommand(const char *line);
+bool handleMoveItIdleCommand(const char *line);
 bool ensureActiveNodeReadyForMotion(const char *reason);
 void runAutomaticBringupAllNodes();
 void clearActiveTargetForNode(uint8_t nodeId, const char *reason);
@@ -661,6 +670,209 @@ void sendRelativePositionDegrees(float relativeDegrees) {
   sendInputPosition(absoluteTurns);
 }
 
+bool sendRelativePositionDegreesToNode(uint8_t nodeId,
+                                       float relativeDegrees,
+                                       bool printSummary,
+                                       bool logCanFrame) {
+  const uint8_t previousActiveNodeId = g_activeNodeId;
+  g_activeNodeId = nodeId;
+  NodeRuntimeState &state = selectedNodeState();
+
+  if (!ensureActiveNodeReadyForMotion("moveit command")) {
+    if (printSummary) {
+      Serial.print("Cannot send relative angle for node 0x");
+      printHexByte(nodeId);
+      Serial.println(": automatic bringup did not complete.");
+    }
+    g_activeNodeId = previousActiveNodeId;
+    return false;
+  }
+
+  if (!jointDegreesWithinLimits(g_activeNodeId, relativeDegrees)) {
+    if (printSummary) {
+      Serial.print("Rejected angle command for node 0x");
+      printHexByte(nodeId);
+      Serial.print(": ");
+      Serial.print(relativeDegrees, 3);
+      Serial.print(" deg is outside limits [");
+      Serial.print(nodeMinJointDegrees(g_activeNodeId), 1);
+      Serial.print(", ");
+      Serial.print(nodeMaxJointDegrees(g_activeNodeId), 1);
+      Serial.println("]");
+    }
+    g_activeNodeId = previousActiveNodeId;
+    return false;
+  }
+
+  const float relativeTurns = jointDegreesToMotorTurns(g_activeNodeId, relativeDegrees);
+  const float absoluteTurns = state.zeroReferenceTurns + relativeTurns;
+
+  state.haveActiveTarget = true;
+  state.lastRelativeCommandTurns = relativeTurns;
+  state.lastRelativeCommandDegrees = relativeDegrees;
+  state.lastAbsoluteCommandTurns = absoluteTurns;
+  state.lastTargetStreamMs = millis();
+
+  if (printSummary) {
+    Serial.print("Relative target node=0x");
+    printHexByte(nodeId);
+    Serial.print(" deg=");
+    Serial.print(relativeDegrees, 3);
+    Serial.print(" -> motor_delta=");
+    Serial.print(relativeTurns, 6);
+    Serial.print(" turns -> absolute target=");
+    Serial.print(absoluteTurns, 6);
+    Serial.println(" turns");
+  }
+
+  sendInputPositionToNode(nodeId, absoluteTurns, 0, 0, printSummary ? "Sent Set_Input_Pos" : nullptr, logCanFrame);
+  g_activeNodeId = previousActiveNodeId;
+  return true;
+}
+
+bool sendJoint4AbsoluteDegrees(float absoluteDegrees, bool printSummary) {
+  if (absoluteDegrees < JOINT4_MIN_DEG || absoluteDegrees > JOINT4_MAX_DEG) {
+    if (printSummary) {
+      Serial.print("Rejected joint4 absolute target ");
+      Serial.print(absoluteDegrees, 3);
+      Serial.print(" deg outside limits [");
+      Serial.print(JOINT4_MIN_DEG, 1);
+      Serial.print(", ");
+      Serial.print(JOINT4_MAX_DEG, 1);
+      Serial.println("]");
+    }
+    return false;
+  }
+
+  if (!g_joint4State.speedConfigured && !ze300_joint4::initialize(canController, g_joint4State)) {
+    if (printSummary) {
+      Serial.println("joint4 ZE300 speed init failed");
+    }
+    return false;
+  }
+
+  const bool ok = ze300_joint4::sendAbsoluteDegrees(canController, g_joint4State, absoluteDegrees);
+  if (printSummary) {
+    Serial.print("Joint4 target=");
+    Serial.print(absoluteDegrees, 3);
+    Serial.print(" deg send=");
+    Serial.println(ok ? "ok" : "fail");
+  }
+  return ok;
+}
+
+bool handleMoveItBridgeCommand(const char *line) {
+  if (line == nullptr) {
+    return false;
+  }
+
+  const bool is_triplet =
+      (strncmp(line, "j ", 2) == 0 || strncmp(line, "js ", 3) == 0);
+  const bool is_quartet =
+      (strncmp(line, "j4 ", 3) == 0 || strncmp(line, "js4 ", 4) == 0);
+  if (!(is_triplet || is_quartet)) {
+    return false;
+  }
+
+  const char *valueText = line;
+  if (is_quartet) {
+    valueText += (line[1] == 's' ? 4 : 3);
+  } else {
+    valueText += (line[1] == 's' ? 3 : 2);
+  }
+  char buffer[SERIAL_LINE_BUFFER_SIZE] = {};
+  strncpy(buffer, valueText, sizeof(buffer) - 1);
+
+  char *savePtr = nullptr;
+  char *token1 = strtok_r(buffer, " \t", &savePtr);
+  char *token2 = strtok_r(nullptr, " \t", &savePtr);
+  char *token3 = strtok_r(nullptr, " \t", &savePtr);
+  char *token4 = strtok_r(nullptr, " \t", &savePtr);
+  char *token5 = strtok_r(nullptr, " \t", &savePtr);
+
+  if (is_triplet &&
+      (token1 == nullptr || token2 == nullptr || token3 == nullptr || token4 != nullptr)) {
+    Serial.println("Usage: j <joint1_deg> <joint2_deg> <joint3_deg>");
+    return true;
+  }
+  if (is_quartet &&
+      (token1 == nullptr || token2 == nullptr || token3 == nullptr || token4 == nullptr || token5 != nullptr)) {
+    Serial.println("Usage: j4 <joint1_deg> <joint2_deg> <joint3_deg> <joint4_deg>");
+    return true;
+  }
+
+  char *end1 = nullptr;
+  char *end2 = nullptr;
+  char *end3 = nullptr;
+  const float joint1Deg = strtof(token1, &end1);
+  const float joint2Deg = strtof(token2, &end2);
+  const float joint3Deg = strtof(token3, &end3);
+  char *end4 = nullptr;
+  const float joint4Deg = is_quartet ? strtof(token4, &end4) : 0.0f;
+  if (end1 == token1 || *end1 != '\0' ||
+      end2 == token2 || *end2 != '\0' ||
+      end3 == token3 || *end3 != '\0' ||
+      (is_quartet && (end4 == token4 || *end4 != '\0'))) {
+    if (is_quartet) {
+      Serial.println("Invalid joint quartet. Example: j4 10.0 20.0 -15.0 5.0");
+    } else {
+      Serial.println("Invalid joint triplet. Example: j 10.0 20.0 -15.0");
+    }
+    return true;
+  }
+
+  const bool ok1 = sendRelativePositionDegreesToNode(NODE_ID_10, joint1Deg, false, false);
+  const bool ok2 = sendRelativePositionDegreesToNode(NODE_ID_11, joint2Deg, false, false);
+  const bool ok3 = sendRelativePositionDegreesToNode(NODE_ID_12, joint3Deg, false, false);
+  const bool ok4 = is_quartet ? sendJoint4AbsoluteDegrees(joint4Deg, false) : true;
+
+  if (!(ok1 && ok2 && ok3 && ok4)) {
+    Serial.print(is_quartet ? "MoveIt quartet partially applied: joint1=" : "MoveIt triplet partially applied: joint1=");
+    Serial.print(ok1 ? "ok" : "fail");
+    Serial.print(" joint2=");
+    Serial.print(ok2 ? "ok" : "fail");
+    Serial.print(" joint3=");
+    Serial.print(ok3 ? "ok" : "fail");
+    if (is_quartet) {
+      Serial.print(" joint4=");
+      Serial.print(ok4 ? "ok" : "fail");
+    }
+    Serial.println();
+    return true;
+  }
+
+  Serial.print(is_quartet ? "MoveIt quartet applied: joint1=" : "MoveIt triplet applied: joint1=");
+  Serial.print(joint1Deg, 3);
+  Serial.print(" joint2=");
+  Serial.print(joint2Deg, 3);
+  Serial.print(" joint3=");
+  Serial.print(joint3Deg, 3);
+  if (is_quartet) {
+    Serial.print(" joint4=");
+    Serial.print(joint4Deg, 3);
+  }
+  Serial.println();
+  return true;
+}
+
+bool handleMoveItIdleCommand(const char *line) {
+  if (line == nullptr) {
+    return false;
+  }
+
+  if (!(strcmp(line, "jx") == 0 || strcmp(line, "jx4") == 0 || strcmp(line, "jidle4") == 0)) {
+    return false;
+  }
+
+  sendAxisStateRequestToNode(NODE_ID_10, AXIS_STATE_IDLE, nullptr, false);
+  sendAxisStateRequestToNode(NODE_ID_11, AXIS_STATE_IDLE, nullptr, false);
+  sendAxisStateRequestToNode(NODE_ID_12, AXIS_STATE_IDLE, nullptr, false);
+  const bool ze300_ok = ze300_joint4::disable(canController);
+  Serial.print("MoveIt 4-DOF idle applied; joint4=");
+  Serial.println(ze300_ok ? "ok" : "fail");
+  return true;
+}
+
 void printMotionState() {
   const NodeRuntimeState &state = selectedNodeState();
   const float relativeTurnsFromZero = state.lastEncoderPosTurns - state.zeroReferenceTurns;
@@ -767,6 +979,9 @@ void printHelp() {
   Serial.println("  u      : print boot configuration summary");
   Serial.println("  f      : print failsafe-aware status for all nodes");
   Serial.println("  g <n>  : send relative joint angle in degrees from zero");
+  Serial.println("  j a b c: set joints 1-3 together in degrees (MoveIt bridge)");
+  Serial.println("  j4 a b c d: set joints 1-4 together, with joint4 absolute ZE300 degrees");
+  Serial.println("  jx     : idle joints 1-4 together (MoveIt bridge)");
   Serial.println("  t <n>  : send relative motor turns from zero (debug)");
   Serial.println("  k      : toggle 20 Hz resend of last Set_Input_Pos");
   Serial.println("  w      : normal one-shot mode");
@@ -1170,6 +1385,14 @@ void handleLineCommand(const char *line) {
     return;
   }
 
+  if (handleMoveItBridgeCommand(line)) {
+    return;
+  }
+
+  if (handleMoveItIdleCommand(line)) {
+    return;
+  }
+
   const bool isTurnCommand = line[0] == 't';
   const bool isDegreeShortCommand = line[0] == 'g';
   const bool isDegreeWordCommand =
@@ -1275,8 +1498,8 @@ void setup() {
   pinMode(PIN_CAN_INT, INPUT_PULLUP);
   SPI.begin(PIN_CAN_SCK, PIN_CAN_MISO, PIN_CAN_MOSI, PIN_CAN_CS);
 
-  Serial.println("ESP32 + MCP2515 ODrive CAN controller (3-DOF)");
-  Serial.println("Supported nodes: 0x10, 0x11, 0x12");
+  Serial.println("ESP32 + MCP2515 MoveIt controller (4-DOF)");
+  Serial.println("Supported joints: 0x10, 0x11, 0x12 (ODrive) + joint4 ZE300");
   Serial.print("Default active node: 0x12, bitrate: ");
   Serial.print(bitrateName(g_bitrate));
   Serial.print(", mode: ");
@@ -1288,6 +1511,12 @@ void setup() {
   }
 
   runAutomaticBringupAllNodes();
+
+  if (ze300_joint4::initialize(canController, g_joint4State)) {
+    Serial.println("joint4 ZE300 speed configured");
+  } else {
+    Serial.println("joint4 ZE300 speed configuration failed");
+  }
 
   printConfig();
   printHelp();
@@ -1307,7 +1536,7 @@ void loop() {
       continue;
     }
 
-    const bool beginsLineCommand = (c == 't' || c == 'g' || c == 'd');
+    const bool beginsLineCommand = (c == 't' || c == 'g' || c == 'd' || c == 'j');
     if (g_serialLineLen == 0 && !beginsLineCommand) {
       switch (c) {
         case 'h':
