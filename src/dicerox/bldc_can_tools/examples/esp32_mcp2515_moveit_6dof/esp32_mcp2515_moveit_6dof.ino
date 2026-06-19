@@ -32,6 +32,18 @@ constexpr float JOINT6_MAX_DEG = 90.0f;
 constexpr uint32_t JS6_SNAPSHOT_TIMEOUT_MS = 450;
 constexpr size_t COORDINATED_JOINT_COUNT = 6;
 constexpr uint32_t RAMP_DEBUG_LOG_INTERVAL_MS = 250;
+constexpr uint8_t CAN_SEND_FAIL_THRESHOLD = 5;
+constexpr uint32_t CAN_FAULT_WINDOW_MS = 1000;
+constexpr uint32_t MOTOR_HEARTBEAT_TIMEOUT_MS = 2500;
+constexpr uint8_t MOTOR_COMMAND_FAIL_THRESHOLD = 3;
+constexpr bool CAN_FAULT_DISARM_IF_REACHABLE = true;
+
+enum class FirmwareState : uint8_t {
+  MotorsUninitialized,
+  MotorsInitializing,
+  MotorsReady,
+  FaultCan,
+};
 
 const float DEFAULT_COORDINATED_MAX_VELOCITY_DPS[COORDINATED_JOINT_COUNT] = {
     10.0f, 8.0f, 8.0f, 20.0f, 20.0f, 20.0f};
@@ -105,10 +117,18 @@ CanMode g_mode = CanMode::Normal;
 Bitrate g_bitrate = Bitrate::Kbps500;
 Oscillator g_oscillator = Oscillator::MHz8;
 bool g_auxFiltersEnabled = false;  // when false, LKTech/ZE300 IDs are excluded from RX filters
+bool g_canControllerReady = false;
 bool g_showAllStandardFrames = false;
 bool g_printEncoderTelemetry = false;
 bool g_streamLastTarget = true;
-bool g_backgroundBringupEnabled = true;
+bool g_backgroundBringupEnabled = false;
+FirmwareState g_firmwareState = FirmwareState::MotorsUninitialized;
+bool g_motorsInitialized = false;
+uint8_t g_canSendFailCount = 0;
+uint8_t g_motorCommandFailCount = 0;
+unsigned long g_canFaultWindowStartMs = 0;
+unsigned long g_motorFaultWindowStartMs = 0;
+char g_lastFirmwareFault[96] = "none";
 uint8_t g_activeNodeId = DEFAULT_ODRIVE_NODE_ID;
 size_t g_nextBackgroundBringupIndex = 0;
 unsigned long g_lastBackgroundBringupMs = 0;
@@ -201,6 +221,24 @@ void printCoordinatedRampLimits();
 bool readJointSnapshot(float *jointDeg, char *errorText, size_t errorTextSize);
 void printJointSnapshot();
 void armAuxJointHoldTargetsAfterBoot();
+bool initializeAllMotorsExplicitly();
+void printFirmwareStatus6();
+void disarmAllMotors(const char *reason);
+void enterCanFault(const char *reason);
+void noteCanSendResult(bool success, const char *context);
+void noteMotorCommandResult(bool success, const char *context);
+void serviceCanHealth();
+bool handleLifecycleCommand(const char *line);
+
+const char *firmwareStateName(FirmwareState state) {
+  switch (state) {
+    case FirmwareState::MotorsUninitialized: return "MOTORS_UNINITIALIZED";
+    case FirmwareState::MotorsInitializing: return "MOTORS_INITIALIZING";
+    case FirmwareState::MotorsReady: return "MOTORS_READY";
+    case FirmwareState::FaultCan: return "FAULT_CAN";
+  }
+  return "UNKNOWN";
+}
 
 bool isTrackedNodeId(uint8_t nodeId) {
   return odrive_can_sniffer::isSupportedNodeId(nodeId);
@@ -609,6 +647,7 @@ bool applyCanMode() {
 }
 
 bool configureCan() {
+  g_canControllerReady = false;
   canController.reset();
 
   const CAN_SPEED speed = bitrateValue(g_bitrate);
@@ -650,6 +689,7 @@ bool configureCan() {
   }
 
   Serial.println("MCP2515 configured OK");
+  g_canControllerReady = true;
   return true;
 }
 
@@ -1092,6 +1132,7 @@ bool sendFrame(const can_frame &frame, const char *message = nullptr, bool logFr
 
   const MCP2515::ERROR sendResult = canController.sendMessage(&tx);
   if (sendResult != MCP2515::ERROR_OK) {
+    noteCanSendResult(false, "odrive_send");
     const uint32_t arbitrationId = isExtendedFrame(tx)
                                        ? (tx.can_id & 0x1FFFFFFFUL)
                                        : getStandardId(tx);
@@ -1109,11 +1150,59 @@ bool sendFrame(const can_frame &frame, const char *message = nullptr, bool logFr
     return false;
   }
 
+  noteCanSendResult(true, "odrive_send");
+
   if (message != nullptr) {
     Serial.println(message);
   }
 
   return true;
+}
+
+void noteCanSendResult(bool success, const char *context) {
+  if (success) {
+    g_canSendFailCount = 0;
+    return;
+  }
+  const unsigned long now = millis();
+  if (g_canFaultWindowStartMs == 0 || now - g_canFaultWindowStartMs > CAN_FAULT_WINDOW_MS) {
+    g_canFaultWindowStartMs = now;
+    g_canSendFailCount = 0;
+  }
+  if (g_canSendFailCount < 255) {
+    ++g_canSendFailCount;
+  }
+  if (g_canSendFailCount >= CAN_SEND_FAIL_THRESHOLD && g_firmwareState != FirmwareState::FaultCan) {
+    char reason[96] = {};
+    snprintf(reason, sizeof(reason), "can_bus_lost context=%s failures=%u",
+             context != nullptr ? context : "unknown", g_canSendFailCount);
+    enterCanFault(reason);
+  }
+}
+
+void noteMotorCommandResult(bool success, const char *context) {
+  const unsigned long now = millis();
+  if (success) {
+    if (g_motorFaultWindowStartMs != 0 &&
+        now - g_motorFaultWindowStartMs > CAN_FAULT_WINDOW_MS) {
+      g_motorCommandFailCount = 0;
+      g_motorFaultWindowStartMs = 0;
+    }
+    return;
+  }
+  if (g_motorFaultWindowStartMs == 0 || now - g_motorFaultWindowStartMs > CAN_FAULT_WINDOW_MS) {
+    g_motorFaultWindowStartMs = now;
+    g_motorCommandFailCount = 0;
+  }
+  if (g_motorCommandFailCount < 255) {
+    ++g_motorCommandFailCount;
+  }
+  if (g_motorCommandFailCount >= MOTOR_COMMAND_FAIL_THRESHOLD) {
+    char reason[96] = {};
+    snprintf(reason, sizeof(reason), "motor_command_failed context=%s failures=%u",
+             context != nullptr ? context : "unknown", g_motorCommandFailCount);
+    enterCanFault(reason);
+  }
 }
 
 void sendAxisStateRequest(uint32_t state) {
@@ -1521,6 +1610,11 @@ bool handleMoveItBridgeCommand(const char *line) {
 
   const char *valueText = line;
   if (is_sextet) {
+    if (!g_motorsInitialized || g_firmwareState != FirmwareState::MotorsReady) {
+      Serial.print("MoveIt sextet rejected: firmware_state=");
+      Serial.println(firmwareStateName(g_firmwareState));
+      return true;
+    }
     valueText += (line[1] == 's' ? 4 : 3);
   } else if (is_quartet) {
     valueText += (line[1] == 's' ? 4 : 3);
@@ -1713,11 +1807,201 @@ bool handleMoveItIdleCommand(const char *line) {
   g_auxTargets.joint4HaveTarget = false;
   g_auxTargets.joint5HaveTarget = false;
   g_auxTargets.joint6HaveTarget = false;
-  Serial.print("MoveIt idle applied; joint4=");
+  g_motorsInitialized = false;
+  if (g_firmwareState != FirmwareState::FaultCan) {
+    g_firmwareState = FirmwareState::MotorsUninitialized;
+  }
+  Serial.print("MoveIt idle/disable applied (motors loose; re-init required); joint4=");
   Serial.print(ze300_ok ? "ok" : "fail");
   Serial.print(" joint5-6=");
   Serial.println(lk_ok ? "ok" : "fail");
   return true;
+}
+
+void disarmAllMotors(const char *reason) {
+  clearCoordinatedSextetTarget();
+  g_auxTargets.joint4HaveTarget = false;
+  g_auxTargets.joint5HaveTarget = false;
+  g_auxTargets.joint6HaveTarget = false;
+  for (size_t i = 0; i < SUPPORTED_NODE_COUNT; ++i) {
+    g_nodeStates[i].haveActiveTarget = false;
+  }
+
+  // Best effort only: if CAN is physically disconnected these commands cannot
+  // reach the drivers. Mechanical/electrical protection must not rely on this.
+  if (modeAllowsTransmit(g_mode)) {
+    (void)sendAxisStateRequestToNode(NODE_ID_10, AXIS_STATE_IDLE, nullptr, false);
+    (void)sendAxisStateRequestToNode(NODE_ID_11, AXIS_STATE_IDLE, nullptr, false);
+    (void)sendAxisStateRequestToNode(NODE_ID_12, AXIS_STATE_IDLE, nullptr, false);
+    (void)ze300_joint4::disable(canController);
+    (void)lktech_joint56::stopAll(canController, g_joint56State);
+  }
+  g_motorsInitialized = false;
+  if (g_firmwareState != FirmwareState::FaultCan) {
+    g_firmwareState = FirmwareState::MotorsUninitialized;
+  }
+  Serial.print("disarm6ok reason=");
+  Serial.println(reason != nullptr ? reason : "operator");
+}
+
+void enterCanFault(const char *reason) {
+  if (g_firmwareState == FirmwareState::FaultCan) {
+    return;
+  }
+  g_firmwareState = FirmwareState::FaultCan;
+  g_motorsInitialized = false;
+  clearCoordinatedSextetTarget();
+  g_auxTargets.joint4HaveTarget = false;
+  g_auxTargets.joint5HaveTarget = false;
+  g_auxTargets.joint6HaveTarget = false;
+  snprintf(g_lastFirmwareFault, sizeof(g_lastFirmwareFault), "%s",
+           reason != nullptr ? reason : "can_bus_lost");
+  Serial.print("fault6 ");
+  Serial.println(g_lastFirmwareFault);
+  Serial.println("WARNING: CAN fault latched; motor stop cannot be guaranteed if drivers are unreachable");
+  if (CAN_FAULT_DISARM_IF_REACHABLE && modeAllowsTransmit(g_mode)) {
+    Serial.println("CAN fault policy: attempting one best-effort motor disable/stop");
+    (void)sendAxisStateRequestToNode(NODE_ID_10, AXIS_STATE_IDLE, nullptr, false);
+    (void)sendAxisStateRequestToNode(NODE_ID_11, AXIS_STATE_IDLE, nullptr, false);
+    (void)sendAxisStateRequestToNode(NODE_ID_12, AXIS_STATE_IDLE, nullptr, false);
+    (void)ze300_joint4::disable(canController);
+    (void)lktech_joint56::stopAll(canController, g_joint56State);
+  }
+}
+
+void printFirmwareStatus6() {
+  const uint8_t eflg = canController.getErrorFlags();
+  Serial.print("status6 state=");
+  Serial.print(firmwareStateName(g_firmwareState));
+  Serial.print(" can_ready=");
+  Serial.print(g_canControllerReady && modeAllowsTransmit(g_mode) ? "true" : "false");
+  Serial.print(" eflg=0x");
+  Serial.print(eflg, HEX);
+  Serial.print(" motors_initialized=");
+  Serial.print(g_motorsInitialized ? "true" : "false");
+  for (size_t i = 0; i < SUPPORTED_NODE_COUNT; ++i) {
+    Serial.print(" j");
+    Serial.print(i + 1);
+    Serial.print("_ready=");
+    Serial.print(nodeIsReadyForMotion(g_nodeStates[i]) ? "true" : "false");
+    Serial.print(" j");
+    Serial.print(i + 1);
+    Serial.print("_zero=");
+    Serial.print(g_nodeStates[i].haveZeroReference ? "true" : "false");
+    Serial.print(" j");
+    Serial.print(i + 1);
+    Serial.print("_err=0x");
+    Serial.print(g_nodeStates[i].lastHeartbeatActiveErrors, HEX);
+  }
+  Serial.print(" j4_ready=");
+  Serial.print(g_joint4State.speedConfigured && g_joint4State.haveSoftwareZero ? "true" : "false");
+  Serial.print(" j4_zero=");
+  Serial.print(g_joint4State.haveSoftwareZero ? "true" : "false");
+  Serial.print(" j5_ready=");
+  Serial.print(g_joint56State.joints[0].enabled && g_joint56State.joints[0].haveZero ? "true" : "false");
+  Serial.print(" j5_zero=");
+  Serial.print(g_joint56State.joints[0].haveZero ? "true" : "false");
+  Serial.print(" j6_ready=");
+  Serial.print(g_joint56State.joints[1].enabled && g_joint56State.joints[1].haveZero ? "true" : "false");
+  Serial.print(" j6_zero=");
+  Serial.print(g_joint56State.joints[1].haveZero ? "true" : "false");
+  Serial.print(" coordinated_allowed=");
+  Serial.print(g_motorsInitialized && g_firmwareState == FirmwareState::MotorsReady ? "true" : "false");
+  Serial.print(" fault=");
+  Serial.println(g_lastFirmwareFault);
+}
+
+bool initializeAllMotorsExplicitly() {
+  if (g_firmwareState == FirmwareState::MotorsInitializing) {
+    Serial.println("init6err already_initializing");
+    return false;
+  }
+
+  g_firmwareState = FirmwareState::MotorsInitializing;
+  g_motorsInitialized = false;
+  g_canSendFailCount = 0;
+  g_motorCommandFailCount = 0;
+  snprintf(g_lastFirmwareFault, sizeof(g_lastFirmwareFault), "none");
+  clearCoordinatedSextetTarget();
+  initializeRuntimeStates();
+  ze300_joint4::reset(g_joint4State);
+  lktech_joint56::reset(g_joint56State);
+  g_auxTargets = {};
+  Serial.println("init6 started");
+
+  if (!modeAllowsTransmit(g_mode)) {
+    g_mode = CanMode::Normal;
+  }
+  g_auxFiltersEnabled = false;
+  if (!configureCan()) {
+    g_firmwareState = FirmwareState::MotorsUninitialized;
+    Serial.println("init6err can_controller_not_ready");
+    return false;
+  }
+
+  g_backgroundBringupEnabled = false;
+  runAutomaticBringupAllNodes();
+  if (g_firmwareState == FirmwareState::FaultCan || !allNodesHaveBootConfiguration()) {
+    disarmAllMotors("init6_odrive_failed");
+    Serial.println("init6err odrive_not_ready");
+    return false;
+  }
+
+  g_auxFiltersEnabled = true;
+  if (!configureCan()) {
+    disarmAllMotors("init6_aux_filters_failed");
+    Serial.println("init6err aux_filter_configuration_failed");
+    return false;
+  }
+  if (!ze300_joint4::initialize(canController, g_joint4State)) {
+    disarmAllMotors("init6_joint4_failed");
+    Serial.println("init6err joint4_initialize_failed");
+    return false;
+  }
+  if (!lktech_joint56::initialize(canController, g_joint56State)) {
+    disarmAllMotors("init6_joint56_failed");
+    Serial.println("init6err joint56_initialize_failed");
+    return false;
+  }
+
+  armAuxJointHoldTargetsAfterBoot();
+  if (g_firmwareState == FirmwareState::FaultCan ||
+      !g_auxTargets.joint4HaveTarget || !g_auxTargets.joint5HaveTarget ||
+      !g_auxTargets.joint6HaveTarget) {
+    disarmAllMotors("init6_aux_hold_failed");
+    Serial.println("init6err auxiliary_hold_failed");
+    return false;
+  }
+
+  g_motorsInitialized = true;
+  g_firmwareState = FirmwareState::MotorsReady;
+  Serial.println("init6ok ready=true joints=1,2,3,4,5,6 zeros=true");
+  return true;
+}
+
+bool handleLifecycleCommand(const char *line) {
+  if (strcmp(line, "init6") == 0) {
+    (void)initializeAllMotorsExplicitly();
+    return true;
+  }
+  if (strcmp(line, "status6") == 0) {
+    printFirmwareStatus6();
+    return true;
+  }
+  if (strcmp(line, "disarm6") == 0) {
+    disarmAllMotors("operator");
+    return true;
+  }
+  if (strcmp(line, "hold6") == 0) {
+    if (!g_motorsInitialized || g_firmwareState != FirmwareState::MotorsReady) {
+      Serial.println("hold6err motors_not_ready");
+    } else {
+      clearCoordinatedSextetTarget();
+      Serial.println("hold6ok last motor targets retained; coordinated trajectory stopped");
+    }
+    return true;
+  }
+  return false;
 }
 
 void printMotionState() {
@@ -2158,12 +2442,16 @@ void printHelp() {
   Serial.println("  j a b c: set joints 1-3 together in degrees (MoveIt bridge)");
   Serial.println("  j4 a b c d: set joints 1-4 together; joint4 is relative to ZE300 software zero");
   Serial.println("  j6 a b c d e f: set joints 1-6 together (MoveIt bridge)");
+  Serial.println("  init6  : explicitly initialize all motors and capture relative zeros");
+  Serial.println("  status6: report firmware/CAN/motor/zero readiness");
+  Serial.println("  hold6  : stop coordinated trajectory updates and retain last driver targets");
+  Serial.println("  disarm6: disable/stop all reachable motors; re-init required");
   Serial.println("  qjs6   : query real measured joint snapshot; replies js6 or js6err");
   Serial.println("  rl6    : print coordinated firmware ramp limits");
   Serial.println("  rv6 a b c d e f: set coordinated max velocity deg/s");
   Serial.println("  ra6 a b c d e f: set coordinated max acceleration deg/s^2");
   Serial.println("  tj4 <deg>, tj5 <deg>, tj6 <deg>: test one aux joint only");
-  Serial.println("  jx/jx6 : idle joints 1-6 together (MoveIt bridge)");
+  Serial.println("  jx/jx6 : disable/loosen joints 1-6; re-init required (not hold)");
   Serial.println("  t <n>  : send relative motor turns from zero (debug)");
   Serial.println("  k      : toggle 20 Hz resend of last Set_Input_Pos");
   Serial.println("  w      : normal one-shot mode");
@@ -2659,6 +2947,10 @@ void handleLineCommand(const char *line) {
     return;
   }
 
+  if (handleLifecycleCommand(line)) {
+    return;
+  }
+
   if (handleMoveItBridgeCommand(line)) {
     return;
   }
@@ -2738,7 +3030,8 @@ void handleLineCommand(const char *line) {
 }
 
 void serviceTargetStreaming() {
-  if (!g_streamLastTarget || !modeAllowsTransmit(g_mode)) {
+  if (!g_streamLastTarget || !modeAllowsTransmit(g_mode) ||
+      !g_motorsInitialized || g_firmwareState != FirmwareState::MotorsReady) {
     return;
   }
 
@@ -2759,6 +3052,8 @@ void serviceTargetStreaming() {
         g_nextCoordinatedSextetAuxFirst);
     g_coordinatedSextetTarget.lastStreamMs = now;
     if (sextetSendSucceeded(result)) {
+      g_motorCommandFailCount = 0;
+      g_motorFaultWindowStartMs = 0;
       g_nextCoordinatedSextetAuxFirst = !g_nextCoordinatedSextetAuxFirst;
       if (now - g_coordinatedSextetTarget.lastDebugLogMs >= RAMP_DEBUG_LOG_INTERVAL_MS) {
         g_coordinatedSextetTarget.lastDebugLogMs = now;
@@ -2779,6 +3074,7 @@ void serviceTargetStreaming() {
       }
     } else {
       printSextetSendResult("WARNING: coordinated sextet stream send incomplete; ", result);
+      noteMotorCommandResult(false, "coordinated_sextet");
     }
     return;
   }
@@ -2797,20 +3093,55 @@ void serviceTargetStreaming() {
   }
 
   if (g_auxTargets.joint4HaveTarget && now - g_auxTargets.joint4LastTxMs >= TARGET_STREAM_INTERVAL_MS) {
-    if (ze300_joint4::sendRelativeDegrees(canController, g_joint4State, g_auxTargets.joint4Deg)) {
+    const bool ok = ze300_joint4::sendRelativeDegrees(
+        canController, g_joint4State, g_auxTargets.joint4Deg);
+    noteMotorCommandResult(ok, "joint4");
+    if (ok) {
       g_auxTargets.joint4LastTxMs = now;
     }
   }
 
   if (g_auxTargets.joint5HaveTarget && now - g_auxTargets.joint5LastTxMs >= TARGET_STREAM_INTERVAL_MS) {
-    if (lktech_joint56::sendOutputDegrees(canController, g_joint56State, 0, g_auxTargets.joint5Deg)) {
+    const bool ok = lktech_joint56::sendOutputDegrees(
+        canController, g_joint56State, 0, g_auxTargets.joint5Deg);
+    noteMotorCommandResult(ok, "joint5");
+    if (ok) {
       g_auxTargets.joint5LastTxMs = now;
     }
   }
 
   if (g_auxTargets.joint6HaveTarget && now - g_auxTargets.joint6LastTxMs >= TARGET_STREAM_INTERVAL_MS) {
-    if (lktech_joint56::sendOutputDegrees(canController, g_joint56State, 1, g_auxTargets.joint6Deg)) {
+    const bool ok = lktech_joint56::sendOutputDegrees(
+        canController, g_joint56State, 1, g_auxTargets.joint6Deg);
+    noteMotorCommandResult(ok, "joint6");
+    if (ok) {
       g_auxTargets.joint6LastTxMs = now;
+    }
+  }
+}
+
+void serviceCanHealth() {
+  if (!g_motorsInitialized || g_firmwareState != FirmwareState::MotorsReady) {
+    return;
+  }
+  const uint8_t eflg = canController.getErrorFlags();
+  if (eflg & MCP2515::EFLG_TXBO) {
+    enterCanFault("mcp2515_bus_off");
+    return;
+  }
+  if (eflg & MCP2515::EFLG_TXEP) {
+    enterCanFault("mcp2515_error_passive");
+    return;
+  }
+  const unsigned long now = millis();
+  for (size_t i = 0; i < SUPPORTED_NODE_COUNT; ++i) {
+    const NodeRuntimeState &state = g_nodeStates[i];
+    if (!state.haveHeartbeat || now - state.lastHeartbeatMs > MOTOR_HEARTBEAT_TIMEOUT_MS) {
+      char reason[96] = {};
+      snprintf(reason, sizeof(reason), "motor_heartbeat_timeout joint=%u",
+               static_cast<unsigned int>(i + 1));
+      enterCanFault(reason);
+      return;
     }
   }
 }
@@ -2854,34 +3185,18 @@ void setup() {
     Serial.println("Initial CAN configuration failed");
   }
 
-  runAutomaticBringupAllNodes();
-
-  // ODrive bringup is complete. Enable auxiliary RX filters so ZE300 and
-  // LKTech reply frames can reach RXB1. Must go through configureCan() — not
-  // configureReceiveFilters() directly — because setFilterMask/setFilter
-  // internally call setConfigMode() without restoring normal mode afterward.
-  // configureCan() ends with applyCanMode() which puts the chip back into
-  // normal mode so frames can be received/transmitted again.
+  // Passive boot: configure communication only. Motor closed-loop requests,
+  // zero capture and hold commands are performed exclusively by explicit init6.
   g_auxFiltersEnabled = true;
   if (!configureCan()) {
     Serial.println("WARNING: failed to reconfigure MCP2515 with full RX filters; aux motor replies may be lost");
   }
 
-  if (ze300_joint4::initialize(canController, g_joint4State)) {
-    Serial.print("joint4 ZE300 speed configured; software zero captured at absolute ");
-    Serial.print(g_joint4State.zeroOffsetDeg, 3);
-    Serial.println(" deg");
-  } else {
-    Serial.println("joint4 ZE300 speed/software zero configuration failed");
-  }
-
-  if (lktech_joint56::initialize(canController, g_joint56State)) {
-    Serial.println("joint5/joint6 LKTech zero capture complete");
-  } else {
-    Serial.println("joint5/joint6 LKTech zero capture failed");
-  }
-
-  armAuxJointHoldTargetsAfterBoot();
+  ze300_joint4::reset(g_joint4State);
+  lktech_joint56::reset(g_joint56State);
+  clearCoordinatedSextetTarget();
+  Serial.println("boot6 ready=true motors_initialized=false passive=true");
+  Serial.println("Motors are uninitialized; send init6 explicitly before motion");
 
   printConfig();
   printHelp();
@@ -2901,7 +3216,9 @@ void loop() {
       continue;
     }
 
-    const bool beginsLineCommand = (c == 't' || c == 'g' || c == 'd' || c == 'j' || c == 'q');
+    const bool beginsLineCommand =
+        (c == 't' || c == 'g' || c == 'd' || c == 'j' || c == 'q' ||
+         c == 'i' || c == 's' || c == 'h');
     if (g_serialLineLen == 0 && !beginsLineCommand) {
       switch (c) {
         case 'h':
@@ -2951,6 +3268,7 @@ void loop() {
 
   processIncomingFrames();
   serviceSafetyFailsafes();
+  serviceCanHealth();
   serviceTargetStreaming();
   serviceBackgroundBringup();
 }

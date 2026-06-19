@@ -82,6 +82,11 @@ def generate_launch_description():
         "allowed_execution_duration_scaling"
     )
     allowed_goal_duration_margin = LaunchConfiguration("allowed_goal_duration_margin")
+    auto_initialize_motors = LaunchConfiguration("auto_initialize_motors")
+    motor_initialization_timeout_sec = LaunchConfiguration(
+        "motor_initialization_timeout_sec"
+    )
+    firmware_status_timeout_sec = LaunchConfiguration("firmware_status_timeout_sec")
 
     moveit_config = (
         MoveItConfigsBuilder("Dicerox_robot_arm_URDF", package_name="dicerox_moveit")
@@ -267,6 +272,24 @@ def generate_launch_description():
                 default_value="10.0",
                 description="Extra hardware-mode MoveIt execution timeout margin in seconds.",
             ),
+            DeclareLaunchArgument(
+                "auto_initialize_motors",
+                default_value="false",
+                description=(
+                    "Opt-in automatic init6 after bridge startup. Even when true, "
+                    "an explicit /rearm is still required before motion."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "motor_initialization_timeout_sec",
+                default_value="20.0",
+                description="Maximum time to wait for the explicit init6 sequence.",
+            ),
+            DeclareLaunchArgument(
+                "firmware_status_timeout_sec",
+                default_value="2.0",
+                description="Maximum time to wait for a status6 response.",
+            ),
             LogInfo(
                 msg=(
                     "Dicerox hardware MoveIt launch: do not run demo.launch.py at "
@@ -365,6 +388,15 @@ def generate_launch_description():
                         ),
                         "trusted_open_loop_hold_rate_hz": ParameterValue(
                             trusted_open_loop_hold_rate_hz, value_type=float
+                        ),
+                        "auto_initialize_motors": ParameterValue(
+                            auto_initialize_motors, value_type=bool
+                        ),
+                        "motor_initialization_timeout_sec": ParameterValue(
+                            motor_initialization_timeout_sec, value_type=float
+                        ),
+                        "firmware_status_timeout_sec": ParameterValue(
+                            firmware_status_timeout_sec, value_type=float
                         ),
                     }
                 ],

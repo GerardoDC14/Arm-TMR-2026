@@ -19,13 +19,46 @@ MoveIt command line used by the bridge:
 
 Highlights:
 
-- automatic ODrive bringup at boot
-- automatic ZE300 joint4 speed setup and software-zero capture at boot
-- automatic LKTech motor-on and zero capture at boot
+- passive boot with no motor enable, zero capture, or position command
+- explicit six-motor initialization through `init6`
+- `status6`, `hold6`, and `disarm6` lifecycle commands
+- latched CAN/heartbeat fault detection reported through `fault6`
 - synchronized 6-joint packets from ROS 2
 - acceleration-limited smoothing in the bridge
+- velocity/acceleration-limited smoothing in the ESP32 firmware
 - fixed-rate target re-streaming on the ESP32 to reduce chopped motion
 - joint4 MoveIt targets are relative to the captured software zero, not the ZE300 hardware zero
 - the first joint4 command is limited to +/-30 degrees from captured zero to catch bad startup poses
-- heartbeat gaps first become a degraded warning; the ESP32 keeps feeding the last safe ODrive target during that window
-- only prolonged heartbeat loss or a confirmed ODrive fault/disarm escalates to a true ESP32 failsafe
+- coordinated motion is rejected until all motors and relative zeros are ready
+
+## Passive boot and initialization
+
+At power-up the ESP32 configures serial, SPI, MCP2515 filters, and internal
+state only. It reports:
+
+```text
+boot6 ready=true motors_initialized=false passive=true
+```
+
+It does not request ODrive closed-loop control or communicate motion/zero
+commands to ZE300 or LKTech motors. Run initialization explicitly through ROS:
+
+```bash
+ros2 service call /moveit_arm_bridge_6dof/initialize_motors std_srvs/srv/Trigger "{}"
+ros2 service call /moveit_arm_bridge_6dof/rearm std_srvs/srv/Trigger "{}"
+```
+
+## Lifecycle serial commands
+
+```text
+init6       initialize all motors and capture six relative zeros
+status6     report firmware, CAN, motor-ready, zero-valid, and fault state
+hold6       stop coordinated target updates and retain the last driver targets
+disarm6     best-effort disable/stop all reachable motors; re-init required
+jx6         legacy disable/loose command; re-init required (not hold)
+```
+
+CAN faults are latched as `fault6 ...`; new `j6` targets are rejected until a
+new explicit `init6` succeeds. If CAN is physically disconnected, firmware can
+detect and report the loss but cannot guarantee that stop commands reach the
+motor drivers.

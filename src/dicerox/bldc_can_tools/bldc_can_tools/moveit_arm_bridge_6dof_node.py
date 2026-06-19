@@ -79,6 +79,8 @@ class BridgeState(Enum):
       bridge replays the last MoveIt pose from before the outage.
     """
     STARTUP         = "STARTUP"          # boot hold-off; no commands sent
+    MOTORS_UNINITIALIZED = "MOTORS_UNINITIALIZED"  # passive firmware; waiting for init6
+    MOTORS_INITIALIZING = "MOTORS_INITIALIZING"    # init6 transaction in progress
     REQUIRES_REARM  = "REQUIRES_REARM"   # safe-idle; waiting for explicit /rearm handshake
     ACTIVE          = "ACTIVE"           # normal operation
     FAULT           = "FAULT"            # hardware fault; commands suppressed, jx6 sent
@@ -275,6 +277,9 @@ class MoveItArmBridge6DofNode(Node):  # type: ignore[misc]
         self.declare_parameter("hardware_snapshot_publish_period_sec", 0.1)
         self.declare_parameter("request_startup_hardware_snapshot", False)
         self.declare_parameter("joint_limit_epsilon_deg", 0.05)
+        self.declare_parameter("auto_initialize_motors", False)
+        self.declare_parameter("motor_initialization_timeout_sec", 20.0)
+        self.declare_parameter("firmware_status_timeout_sec", 2.0)
 
         # ── Read parameters ───────────────────────────────────────────────
         self.serial_port              = str(self.get_parameter("serial_port").value)
@@ -416,6 +421,12 @@ class MoveItArmBridge6DofNode(Node):  # type: ignore[misc]
             self.get_parameter("request_startup_hardware_snapshot").value)
         self.joint_limit_epsilon_deg = float(
             self.get_parameter("joint_limit_epsilon_deg").value)
+        self.auto_initialize_motors = bool(
+            self.get_parameter("auto_initialize_motors").value)
+        self.motor_initialization_timeout_sec = float(
+            self.get_parameter("motor_initialization_timeout_sec").value)
+        self.firmware_status_timeout_sec = float(
+            self.get_parameter("firmware_status_timeout_sec").value)
 
         if self.command_rate_hz <= 0.0:
             raise ValueError("command_rate_hz must be > 0")
@@ -453,6 +464,10 @@ class MoveItArmBridge6DofNode(Node):  # type: ignore[misc]
             raise ValueError("trusted_open_loop_hold_rate_hz must be > 0")
         if self.joint_limit_epsilon_deg < 0.0:
             raise ValueError("joint_limit_epsilon_deg must be >= 0")
+        if self.motor_initialization_timeout_sec <= 0.0:
+            raise ValueError("motor_initialization_timeout_sec must be > 0")
+        if self.firmware_status_timeout_sec <= 0.0:
+            raise ValueError("firmware_status_timeout_sec must be > 0")
         valid_joint_state_source_modes = {"dry_run_fake", "hardware_feedback", "trusted_open_loop"}
         if self.joint_state_source_mode not in valid_joint_state_source_modes:
             raise ValueError(
@@ -508,6 +523,10 @@ class MoveItArmBridge6DofNode(Node):  # type: ignore[misc]
         self._last_hardware_snapshot_publish_request_sec: Optional[float] = None
         self._last_cached_joint_state_republish_sec: Optional[float] = None
         self._startup_hardware_snapshot_requested = False
+        self._motors_initialized = False
+        self._auto_initialization_attempted = False
+        self._latest_firmware_status = "unavailable"
+        self._firmware_fault_reason: Optional[str] = None
 
         self._callback_group = ReentrantCallbackGroup()
 
@@ -583,6 +602,12 @@ class MoveItArmBridge6DofNode(Node):  # type: ignore[misc]
         self._disarm_srv = self.create_service(
             Trigger, "~/disarm", self._handle_disarm_service,
             callback_group=self._callback_group)
+        self._initialize_motors_srv = self.create_service(
+            Trigger, "~/initialize_motors", self._handle_initialize_motors_service,
+            callback_group=self._callback_group)
+        self._status_srv = self.create_service(
+            Trigger, "~/status", self._handle_status_service,
+            callback_group=self._callback_group)
         self._request_snapshot_srv = self.create_service(
             Trigger, "~/request_hardware_snapshot", self._handle_request_snapshot_service,
             callback_group=self._callback_group)
@@ -651,6 +676,8 @@ class MoveItArmBridge6DofNode(Node):  # type: ignore[misc]
             f"snapshot_publish_period={self.hardware_snapshot_publish_period_sec:.2f}s "
             f"startup_snapshot={self.request_startup_hardware_snapshot} "
             f"joint_limit_epsilon={self.joint_limit_epsilon_deg:.3f}deg "
+            f"auto_initialize_motors={self.auto_initialize_motors} "
+            f"motor_init_timeout={self.motor_initialization_timeout_sec:.1f}s "
             f"allow_dry_run_without_active={self.allow_dry_run_without_active_hardware}; "
             f"mappings: {summary}"
         )
@@ -677,6 +704,10 @@ class MoveItArmBridge6DofNode(Node):  # type: ignore[misc]
             self.get_logger().warn(
                 "Hardware motion disabled: set enable_hardware_motion:=true together "
                 "with dry_run:=false to allow serial j6 commands.")
+        else:
+            self.get_logger().warn(
+                "Hardware bridge connected with motors uninitialized. Motion remains "
+                "blocked until /initialize_motors succeeds and /rearm is called.")
 
     # ── Serial port management ────────────────────────────────────────────
 
@@ -715,6 +746,10 @@ class MoveItArmBridge6DofNode(Node):  # type: ignore[misc]
             )
             self._serial_read_buf = b""
             self._clear_motion_state()
+            self._motors_initialized = False
+            self._firmware_fault_reason = "serial reconnected; firmware readiness unknown"
+            if self._real_hardware_motion_requested():
+                self._state = BridgeState.MOTORS_UNINITIALIZED
             self.get_logger().info(f"Reopened serial port {self.serial_port}")
             return True
         except SerialException as exc:
@@ -763,6 +798,8 @@ class MoveItArmBridge6DofNode(Node):  # type: ignore[misc]
         if self._state == BridgeState.FAULT:
             return
         self._state = BridgeState.FAULT
+        self._motors_initialized = False
+        self._firmware_fault_reason = reason
         self._clear_motion_state()
         self._consecutive_serial_failures  = 0
         self._consecutive_partial_applies  = 0
@@ -816,6 +853,11 @@ class MoveItArmBridge6DofNode(Node):  # type: ignore[misc]
             f"{'enabled' if self.auto_rearm_settle_threshold_deg > 0 else 'disabled'})")
 
     def _enter_active(self, reason: str) -> None:
+        if self._real_hardware_motion_requested() and not self._motors_initialized:
+            self.get_logger().error(
+                "Cannot enter ACTIVE: motors have not completed explicit init6")
+            self._state = BridgeState.MOTORS_UNINITIALIZED
+            return
         prev = self._state
         self._state = BridgeState.ACTIVE
         self._fault_cleared_time          = None
@@ -832,6 +874,13 @@ class MoveItArmBridge6DofNode(Node):  # type: ignore[misc]
 
     def _handle_rearm_service(self, request, response):  # type: ignore[no-untyped-def]
         del request
+        if self._real_hardware_motion_requested() and not self._motors_initialized:
+            response.success = False
+            response.message = (
+                "/rearm rejected: motors are uninitialized; call "
+                "/moveit_arm_bridge_6dof/initialize_motors first")
+            self.get_logger().error(response.message)
+            return response
         if self._state != BridgeState.REQUIRES_REARM:
             response.success = False
             response.message = (
@@ -934,18 +983,107 @@ class MoveItArmBridge6DofNode(Node):  # type: ignore[misc]
 
     def _handle_disarm_service(self, request, response):  # type: ignore[no-untyped-def]
         del request
-        self._enter_fault("disarm service invoked")
-        # Immediately fall through to RECOVERY→REQUIRES_REARM path so the
-        # operator doesn't have to wait for an ESP32 'Failsafe cleared' that
-        # may never arrive if this was a precautionary disarm.
-        self._state = BridgeState.RECOVERY
-        self._fault_cleared_time = self.get_clock().now().nanoseconds / 1e9
-        response.success = True
+        if self.dry_run:
+            sent = True
+            detail = "dry-run: disarm6 serial command suppressed"
+        else:
+            sent, detail = self._request_firmware_line(
+                "disarm6", "disarm6ok", "disarm6err",
+                self.firmware_status_timeout_sec)
+        self._motors_initialized = False
+        self._command_epoch += 1
+        self._clear_motion_state()
+        self._state = BridgeState.MOTORS_UNINITIALIZED
+        response.success = sent
         response.message = (
-            f"/disarm executed at epoch={self._command_epoch}; "
-            f"will transition to REQUIRES_REARM after "
-            f"{self.fault_recovery_delay_sec:.1f}s hold-off")
+            f"/disarm {'confirmed' if sent else 'not confirmed'} ({detail}); "
+            "motors marked uninitialized and motion blocked until init6 + /rearm")
         self.get_logger().warn(response.message)
+        return response
+
+    def _request_firmware_line(
+        self,
+        command: str,
+        success_prefix: str,
+        error_prefix: str,
+        timeout_sec: float,
+    ) -> tuple[bool, str]:
+        """Perform one serialized request/reply exchange with the ESP32."""
+        deadline = time.monotonic() + timeout_sec
+        with self._serial_io_lock:
+            if self._serial is None or not self._serial.is_open:
+                if not self._reopen_serial_port():
+                    return False, "serial port unavailable"
+            try:
+                self._serial.reset_input_buffer()  # type: ignore[union-attr]
+                self._serial_read_buf = b""
+                self._serial.write((command + "\n").encode("ascii"))  # type: ignore[union-attr]
+                self._serial.flush()  # type: ignore[union-attr]
+                while time.monotonic() < deadline:
+                    raw = self._serial.readline()  # type: ignore[union-attr]
+                    if not raw:
+                        time.sleep(0.01)
+                        continue
+                    line = raw.decode("ascii", errors="replace").strip()
+                    if not line:
+                        continue
+                    self._handle_serial_status_line(line)
+                    if line.startswith(success_prefix):
+                        return True, line
+                    if line.startswith(error_prefix) or line.startswith("fault6 "):
+                        return False, line
+            except SerialException as exc:
+                return False, f"serial transaction failed: {exc}"
+        return False, f"timed out waiting for {success_prefix}"
+
+    def _initialize_motors(self) -> tuple[bool, str]:
+        if self.dry_run or not self.enable_hardware_motion:
+            return False, "motor initialization requires real enabled hardware mode"
+        if self._action_execution_active:
+            return False, "cannot initialize motors while a trajectory is executing"
+        self._state = BridgeState.MOTORS_INITIALIZING
+        self._motors_initialized = False
+        self._firmware_fault_reason = None
+        self.get_logger().warn("Motor initialization started: sending init6")
+        ok, message = self._request_firmware_line(
+            "init6", "init6ok", "init6err", self.motor_initialization_timeout_sec)
+        if not ok:
+            self._state = BridgeState.MOTORS_UNINITIALIZED
+            self._firmware_fault_reason = message
+            self.get_logger().error(f"Motor initialization failed: {message}")
+            return False, message
+        self._motors_initialized = True
+        self._state = BridgeState.REQUIRES_REARM
+        self._requires_rearm_entered_sec = self.get_clock().now().nanoseconds / 1e9
+        self._rearm_requested = False
+        self._clear_motion_state()
+        self.get_logger().warn(
+            "Motor initialization succeeded; motion remains blocked until /rearm")
+        return True, message
+
+    def _handle_initialize_motors_service(self, request, response):  # type: ignore[no-untyped-def]
+        del request
+        response.success, detail = self._initialize_motors()
+        response.message = detail
+        return response
+
+    def _handle_status_service(self, request, response):  # type: ignore[no-untyped-def]
+        del request
+        if self._action_execution_active:
+            response.success = False
+            response.message = "status6 rejected while FollowJointTrajectory is executing"
+            return response
+        if self.dry_run:
+            response.success = True
+            response.message = (
+                f"bridge_state={self._state.value} dry_run=true motors_initialized=false")
+            return response
+        ok, detail = self._request_firmware_line(
+            "status6", "status6 ", "status6err", self.firmware_status_timeout_sec)
+        if ok:
+            self._latest_firmware_status = detail
+        response.success = ok
+        response.message = detail
         return response
 
     # ── Serial input drain ────────────────────────────────────────────────
@@ -963,7 +1101,32 @@ class MoveItArmBridge6DofNode(Node):  # type: ignore[misc]
         is_moveit_rejected = "MOVEIT " in upper and " REJECTED" in upper
         is_motion_rejected = is_moveit_rejected or "CANNOT SEND" in upper
 
-        if is_failsafe:
+        if line.startswith("status6 "):
+            self._latest_firmware_status = line
+            if "motors_initialized=true" in line and "state=MOTORS_READY" in line:
+                self._motors_initialized = True
+        if line.startswith("boot6 "):
+            self._motors_initialized = False
+            self._firmware_fault_reason = "ESP32 reset/passive boot detected"
+            self._clear_motion_state()
+            if self._real_hardware_motion_requested():
+                self._state = BridgeState.MOTORS_UNINITIALIZED
+            self.get_logger().warn(
+                "ESP32 passive boot detected; motors uninitialized, init6 + /rearm required")
+        if line.startswith("init6ok"):
+            self._motors_initialized = True
+        if line.startswith("init6err"):
+            self._motors_initialized = False
+        if line.startswith("fault6 "):
+            self._motors_initialized = False
+            self._firmware_fault_reason = line
+            self._enter_fault(f"ESP32 firmware fault: {line}")
+        if line.startswith("disarm6ok"):
+            self._motors_initialized = False
+
+        if line.startswith("fault6 "):
+            pass
+        elif is_failsafe:
             self._enter_fault(f"ESP32: {line}")
         elif is_cleared:
             self._enter_recovery(f"ESP32: {line}")
@@ -984,7 +1147,7 @@ class MoveItArmBridge6DofNode(Node):  # type: ignore[misc]
             if "SEXTET" in upper and ("APPLIED" in upper or "COMMITTED" in upper):
                 self._consecutive_partial_applies = 0
 
-        if is_failsafe or "BUS-OFF" in upper or "ERROR_FAILTX" in upper:
+        if line.startswith("fault6 ") or is_failsafe or "BUS-OFF" in upper or "ERROR_FAILTX" in upper:
             self.get_logger().error(f"ESP32: {line}", throttle_duration_sec=1.0)
         elif (
             is_cleared
@@ -1142,6 +1305,7 @@ class MoveItArmBridge6DofNode(Node):  # type: ignore[misc]
         return (
             not self.dry_run
             and self.enable_hardware_motion
+            and self._motors_initialized
             and self._state == BridgeState.ACTIVE
             and trusted_ok
         )
@@ -1628,6 +1792,13 @@ class MoveItArmBridge6DofNode(Node):  # type: ignore[misc]
                 "real hardware goal rejected because enable_hardware_motion is false",
             )
 
+        if not self.dry_run and not self._motors_initialized:
+            return TrajectoryValidation(
+                False,
+                "real hardware goal rejected because motors are uninitialized; "
+                "call /initialize_motors and then /rearm",
+            )
+
         trusted_ok, trusted_reason = self._trusted_joint_state_ok_for_hardware()
         if not trusted_ok:
             return TrajectoryValidation(
@@ -1951,6 +2122,14 @@ class MoveItArmBridge6DofNode(Node):  # type: ignore[misc]
             while True:
                 now_wall_sec = time.monotonic()
                 elapsed_sec = max(0.0, now_wall_sec - start_wall_sec)
+                if self._firmware_fault_reason is not None or self._state == BridgeState.FAULT:
+                    result.error_code = FollowJointTrajectory.Result.PATH_TOLERANCE_VIOLATED
+                    result.error_string = (
+                        f"firmware fault during execution: "
+                        f"{self._firmware_fault_reason or self._state.value}")
+                    self.get_logger().error(result.error_string)
+                    goal_handle.abort()
+                    return result
                 # Execute the full trajectory over time: sample/interpolate by timestamp,
                 # then rate-limit toward that sample. Never consume only the final point.
                 desired_deg_by_joint = self._sample_action_trajectory(points, elapsed_sec)
@@ -2358,7 +2537,12 @@ class MoveItArmBridge6DofNode(Node):  # type: ignore[misc]
                 # Route through REQUIRES_REARM (default) so boot never auto-commands
                 # motion — even if MoveIt happens to publish a stale joint_state
                 # during our startup window.
-                if self.require_explicit_rearm:
+                if self._real_hardware_motion_requested():
+                    self._state = BridgeState.MOTORS_UNINITIALIZED
+                    self.get_logger().warn(
+                        "[STATE → MOTORS_UNINITIALIZED] bridge connected; ESP32 motors "
+                        "must remain passive until /initialize_motors")
+                elif self.require_explicit_rearm:
                     self._enter_requires_rearm(
                         f"startup complete: delay elapsed, "
                         f"{self._startup_serial_lines} serial lines received")
@@ -2379,6 +2563,23 @@ class MoveItArmBridge6DofNode(Node):  # type: ignore[misc]
                     self.get_logger().info(
                         f"[STARTUP] waiting for hardware ready... {remaining:.1f}s",
                         throttle_duration_sec=2.0)
+            return
+
+        if self._state == BridgeState.MOTORS_UNINITIALIZED:
+            if self.auto_initialize_motors and not self._auto_initialization_attempted:
+                self._auto_initialization_attempted = True
+                ok, detail = self._initialize_motors()
+                if not ok:
+                    self.get_logger().error(
+                        f"Automatic motor initialization failed: {detail}")
+            else:
+                self.get_logger().warn(
+                    "[MOTORS_UNINITIALIZED] motion blocked; call "
+                    "/moveit_arm_bridge_6dof/initialize_motors",
+                    throttle_duration_sec=5.0)
+            return
+
+        if self._state == BridgeState.MOTORS_INITIALIZING:
             return
 
         # ── FAULT ─────────────────────────────────────────────────────────

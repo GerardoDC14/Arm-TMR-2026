@@ -58,8 +58,9 @@ Joystick / Keyboard / SpaceMouse
                                            └──→ ros2_control JointTrajectoryController
 ```
 
-For Jaguar, that controller output is already bridged to real hardware.
-For Dicerox, the current output path is the MoveIt mock controller used in RViz / fake hardware.
+Jaguar uses its existing hardware bridges. Dicerox has separate simulation and
+hardware launch paths; hardware execution uses a `FollowJointTrajectory` action
+server in the Python bridge rather than the mock controller.
 
 ## Jaguar
 
@@ -117,11 +118,159 @@ Dicerox is now laid out as a normal sibling robot folder instead of a nested wor
 - `dicerox_moveit`: combined MoveIt config, RViz demo, Servo config, and teleop launches
 - `bldc_can_tools`: mixed-driver CAN utilities, ROS nodes, and ESP32 examples for Dicerox hardware bringup
 
-### Dicerox launch sequence
+### Dicerox architecture
+
+```text
+ROS 2 / MoveIt
+  -> Python bridge
+  -> USB serial
+  -> ESP32
+  -> MCP2515 CAN
+  -> six motor controllers
+```
+
+The six arm joints use three controller families on one CAN bus: ODrive for
+joints 1-3, ZE300 for joint 4, and LKTech/MyActuator for joints 5-6. MoveIt sends
+the complete trajectory to `/dicerox_arm_controller/follow_joint_trajectory`.
+The bridge samples it at 50 Hz, applies per-joint velocity and acceleration
+limits, and streams `j6` targets. The ESP32 applies a second ramp before sending
+commands to the motor drivers.
+
+### Dicerox simulation
 
 ```bash
-# 1. MoveIt + RViz + mock ros2_control
 ros2 launch dicerox_moveit demo.launch.py
+```
+
+Simulation continues to use the fake/mock `joint_trajectory_controller`. Do not
+run simulation and hardware launches together because both would try to own the
+same `FollowJointTrajectory` action name.
+
+### Dicerox hardware
+
+Hardware trusted-open-loop launch:
+
+```bash
+ros2 launch dicerox_moveit hardware.launch.py \
+  dry_run:=false \
+  enable_hardware_motion:=true \
+  joint_state_source_mode:=trusted_open_loop
+```
+
+The hardware launch does not start the mock controller. Motor initialization is
+also disabled by default; launching ROS alone cannot enable or move the motors.
+
+Normal operating sequence:
+
+```bash
+ros2 service call /moveit_arm_bridge_6dof/status std_srvs/srv/Trigger "{}"
+
+ros2 service call /moveit_arm_bridge_6dof/initialize_motors \
+  std_srvs/srv/Trigger "{}"
+
+ros2 service call /moveit_arm_bridge_6dof/rearm \
+  std_srvs/srv/Trigger "{}"
+```
+
+After both initialization and rearm succeed, trajectories can be planned and
+executed from RViz. To intentionally remove holding torque:
+
+```bash
+ros2 service call /moveit_arm_bridge_6dof/disarm std_srvs/srv/Trigger "{}"
+```
+
+Disarm invalidates motor readiness. Another initialization and rearm are
+required before motion can resume.
+
+### Boot and safety lifecycle
+
+```text
+Power ON
+-> ESP32 passive boot
+-> MOTORS_UNINITIALIZED
+-> /initialize_motors
+-> MOTORS_READY / REQUIRES_REARM
+-> /rearm
+-> ACTIVE
+-> MoveIt execution allowed
+```
+
+The ESP32 `setup()` path configures communication and internal state only. It
+does not request ODrive closed-loop control, capture zeros, or command ZE300 or
+LKTech motors. Initialization occurs only after explicit `init6`. `/rearm`
+fails until `init6` has completed successfully.
+
+Bridge states include `STARTUP`, `MOTORS_UNINITIALIZED`,
+`MOTORS_INITIALIZING`, `REQUIRES_REARM`, `ACTIVE`, `FAULT`, and `RECOVERY`.
+An ESP32 reset or serial reconnection invalidates readiness and prevents stale
+targets from resuming automatically.
+
+Relevant launch parameters and safe defaults:
+
+```text
+auto_initialize_motors := false
+motor_initialization_timeout_sec := 20.0
+firmware_status_timeout_sec := 2.0
+trusted_open_loop_hold_after_action := true
+trusted_open_loop_hold_rate_hz := 10.0
+idle_on_action_cancel := false
+```
+
+### Serial commands
+
+```text
+init6
+status6
+hold6
+disarm6
+jx6
+j6 <j1_deg> <j2_deg> <j3_deg> <j4_deg> <j5_deg> <j6_deg>
+```
+
+- `init6` initializes all motor controllers and captures relative zero references.
+- `status6` reports firmware, motor, zero-reference, CAN, and fault state.
+- `hold6` stops coordinated updates but retains the existing holding targets.
+- `disarm6` disables/stops reachable motors and invalidates motion readiness.
+- `jx6` is a disable/loose command, not a hold command.
+- `j6 ...` updates the coordinated six-joint target; firmware ramping prevents jumps.
+
+ROS lifecycle services:
+
+```text
+/moveit_arm_bridge_6dof/initialize_motors
+/moveit_arm_bridge_6dof/status
+/moveit_arm_bridge_6dof/rearm
+/moveit_arm_bridge_6dof/disarm
+```
+
+### Trusted open loop
+
+In `trusted_open_loop`, `/joint_states` are commanded states published for
+MoveIt/RViz synchronization. They are not measured encoder feedback. MoveIt
+success means the trajectory was validated, sampled, limited, and transmitted;
+it does not verify the final physical pose.
+
+After an action, the bridge continues sending the final target at 10 Hz by
+default. Action cancellation does not automatically loosen the arm. Use
+`/disarm` when removing holding torque is intentional.
+
+### CAN faults
+
+Firmware monitors MCP2515/CAN errors, command-send failures, incomplete motor
+bursts, and ODrive heartbeat timeouts. It emits `fault6 ...` and latches
+`FAULT_CAN`; the bridge then enters `FAULT`, aborts active execution, and blocks
+new motion until explicit initialization and rearm.
+
+If the CAN bus is physically disconnected, the ESP32 cannot guarantee that a
+stop or disable command reaches the motor drivers. Mechanical support and
+hardware-level emergency protection remain necessary.
+
+### Dicerox teleoperation
+
+The following commands operate the simulation/Servo path and are separate from
+the hardware lifecycle above:
+
+```bash
 
 # 2. MoveIt Servo
 ros2 launch dicerox_moveit servo.launch.py
@@ -140,7 +289,7 @@ ros2 launch dicerox_moveit spacemouse.launch.py
 
 - The MoveIt model includes the arm and the chassis flippers, but MoveIt Servo is configured for the `dicerox_arm` group only.
 - `dicerox_moveit` now has its own `servo.launch.py` and `servo_params.yaml`, mirroring the Jaguar workflow.
-- The Dicerox hardware bridge from MoveIt output to the real mixed CAN motor stack is not finished yet. The repo already contains the lower-level work under `src/dicerox/bldc_can_tools` and its ESP32 examples.
+- The hardware bridge is the only `FollowJointTrajectory` action server in hardware mode; simulation retains mock-controller support.
 
 ## Input mapping
 
