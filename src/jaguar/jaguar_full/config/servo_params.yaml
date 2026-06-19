@@ -8,14 +8,18 @@ servo_node:
       use_gazebo: false
 
       ## Incoming command properties
-      command_in_type: "unitless"  # "unitless" -> [-1:1] like joystick; "speed_units" -> m/s and rad/s
+      ## "unitless" = servo node scales [-1, 1] input by scale.linear/rotational below.
+      ## Teleop nodes output values in [-1, 1] range; these scale values are the
+      ## single velocity tuning point.
+      command_in_type: "unitless"
       scale:
-        linear: 0.2       # Max linear velocity [m/s] for Cartesian commands
-        rotational: 0.35  # Max angular velocity [rad/s] for Cartesian commands
-        joint: 0.35       # Max joint velocity [rad/s] for joint commands
+        linear:     0.3    # max Cartesian translational velocity [m/s] at full stick
+        rotational: 0.6    # max Cartesian rotational velocity [rad/s] at full stick
+        joint:      1.0    # max joint velocity [rad/s] for joint jog mode
 
       ## Outgoing command properties
-      publish_period: 0.034          # ~30 Hz
+      ## 50 Hz matches spacemouse_servo publish_rate_hz.
+      publish_period: 0.020
       low_latency_mode: false
 
       command_out_type: trajectory_msgs/JointTrajectory
@@ -24,6 +28,9 @@ servo_node:
       publish_joint_accelerations: false
 
       ## Smoothing
+      ## low_latency_mode: true bypasses the servo-side Butterworth filter.
+      ## spacemouse_servo already applies EMA (alpha=0.65); double-filtering adds lag.
+      low_latency_mode: true
       smoothing_filter_plugin_name: "online_signal_smoothing::ButterworthFilterPlugin"
 
       ## Planning scene — set false when move_group is running alongside servo
@@ -45,7 +52,10 @@ servo_node:
       lower_singularity_threshold: 120.0    # start decelerating at this condition number
       hard_stop_singularity_threshold: 300.0 # emergency stop at this condition number
       joint_limit_margin: 0.1
-      leaving_singularity_threshold_multiplier: 2.0
+      ## leaving_singularity_threshold_multiplier:
+      ##   Arm must reach condition_number < lower/multiplier to count as "leaving".
+      ##   Was 2.0 (band 60–120) — caused oscillation.  1.3 reduces ping-pong.
+      leaving_singularity_threshold_multiplier: 1.3
 
       ## Topic names
       cartesian_command_in_topic: ~/delta_twist_cmds

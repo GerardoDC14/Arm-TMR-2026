@@ -221,7 +221,7 @@ What it does:
 - sends one synchronized `j4 ...` command for all four joints
 - uses `jx` if stale input should idle all four joints together
 - keeps the ODrive smoothing / hold-last-target behavior and adds ZE300 joint4 on top
-- `joint4_offset_deg` lets you shift joint4 if the ZE300 absolute zero does not match MoveIt zero exactly
+- `joint4_offset_deg` is a bridge-side trim on top of the ESP32 ZE300 software zero; the ESP32 captures joint4's current ZE300 position at boot and treats MoveIt joint4 commands as relative to that captured pose
 
 ## MoveIt `/joint_states` To 6-DOF Arm Bridge
 
@@ -234,8 +234,8 @@ Then run:
 ```bash
 ros2 run bldc_can_tools moveit_arm_bridge_6dof --ros-args \
   -p serial_port:=/dev/ttyUSB0 \
-  -p baud_rate:=115200 \
-  -p command_rate_hz:=20.0 \
+  -p baud_rate:=921600 \
+  -p command_rate_hz:=50.0 \
   -p min_delta_deg:=0.2 \
   -p joint_state_timeout_sec:=3.0 \
   -p idle_on_stale:=false \
@@ -246,15 +246,18 @@ ros2 run bldc_can_tools moveit_arm_bridge_6dof --ros-args \
 
 What it does:
 
-- subscribes to `/joint_states`
+- subscribes to `/joint_states` for physical-state sync and fallback
+- prefers `/jaguar_arm_controller/joint_trajectory` or `/dicerox_arm_controller/joint_trajectory` when available, falls back to controller interpolation, and only then falls back to `/joint_states`; whichever source wins is still passed through the bridge velocity/acceleration limiter so sparse IK goals do not snap the arm
 - reads `Joint1` through `Joint6`
 - converts radians to physical degrees with these mappings:
   `Joint1 -> -degrees(rad)`, `Joint2 -> -degrees(rad)`, `Joint3 -> -degrees(rad)`, `Joint4 -> -degrees(rad)`, `Joint5 -> degrees(rad)`, `Joint6 -> degrees(rad)`
 - applies limits:
   `Joint1 -> [-90, 90]`, `Joint2 -> [0, 180]`, `Joint3 -> [-200, 0]`, `Joint4 -> [-90, 90]`, `Joint5 -> [-90, 90]`, `Joint6 -> [-90, 90]`
 - sends one synchronized `j6 ...` command for all six joints
-- uses an acceleration-limited bridge profile plus ESP32-side target re-streaming to reduce stop-go motion
-- auto-initializes joint4 speed and auto-captures joint5/joint6 zero on boot
+- forwards the freshest coordinated trajectory sample directly instead of replacing MoveIt's timing with a bridge-side ramp
+- treats short ODrive heartbeat gaps as a degraded communication warning while continuing to re-stream the last safe target
+- only escalates to an ESP32 failsafe after a much longer prolonged-heartbeat loss or a confirmed ODrive fault/disarm
+- auto-initializes joint4 speed, captures joint4's ZE300 software zero, and auto-captures joint5/joint6 zero on boot
 
 ## Run `cansniffer.py`
 

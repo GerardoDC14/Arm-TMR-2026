@@ -43,6 +43,7 @@ inline void resetNodeState(NodeRuntimeState &state) {
   state.haveHeartbeat = false;
   state.haveErrorStatus = false;
   state.failsafeLatched = false;
+  state.heartbeatWarningActive = false;
   state.lastEncoderPosTurns = 0.0f;
   state.lastEncoderVelTurnsPerSecond = 0.0f;
   state.zeroReferenceTurns = 0.0f;
@@ -58,6 +59,7 @@ inline void resetNodeState(NodeRuntimeState &state) {
   state.lastErrorMs = 0;
   state.lastEncoderEstimateMs = 0;
   state.lastEncoderTelemetryPrintMs = 0;
+  state.lastHeartbeatWarningLogMs = 0;
   state.lastFailsafeMs = 0;
 }
 

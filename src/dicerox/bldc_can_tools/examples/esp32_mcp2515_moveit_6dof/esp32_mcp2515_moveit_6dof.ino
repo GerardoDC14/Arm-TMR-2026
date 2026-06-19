@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <SPI.h>
+#include <math.h>
 #include <mcp2515.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,10 +24,19 @@ using namespace odrive_can_sniffer;
 
 constexpr float JOINT4_MIN_DEG = -90.0f;
 constexpr float JOINT4_MAX_DEG = 90.0f;
+constexpr float JOINT4_FIRST_COMMAND_MAX_DEG = 30.0f;
 constexpr float JOINT5_MIN_DEG = -90.0f;
 constexpr float JOINT5_MAX_DEG = 90.0f;
 constexpr float JOINT6_MIN_DEG = -90.0f;
 constexpr float JOINT6_MAX_DEG = 90.0f;
+constexpr uint32_t JS6_SNAPSHOT_TIMEOUT_MS = 450;
+constexpr size_t COORDINATED_JOINT_COUNT = 6;
+constexpr uint32_t RAMP_DEBUG_LOG_INTERVAL_MS = 250;
+
+const float DEFAULT_COORDINATED_MAX_VELOCITY_DPS[COORDINATED_JOINT_COUNT] = {
+    10.0f, 8.0f, 8.0f, 20.0f, 20.0f, 20.0f};
+const float DEFAULT_COORDINATED_MAX_ACCEL_DPS2[COORDINATED_JOINT_COUNT] = {
+    30.0f, 24.0f, 24.0f, 60.0f, 60.0f, 60.0f};
 
 struct AuxJointTargetState {
   bool joint4HaveTarget;
@@ -38,6 +48,54 @@ struct AuxJointTargetState {
   unsigned long joint4LastTxMs;
   unsigned long joint5LastTxMs;
   unsigned long joint6LastTxMs;
+};
+
+struct CoordinatedSextetTargetState {
+  bool haveTarget;
+  bool rampInitialized;
+  uint32_t epoch;
+  float joint1Deg;
+  float joint2Deg;
+  float joint3Deg;
+  float joint4Deg;
+  float joint5Deg;
+  float joint6Deg;
+  float commandedDeg[COORDINATED_JOINT_COUNT];
+  float velocityDps[COORDINATED_JOINT_COUNT];
+  unsigned long lastStreamMs;
+  unsigned long lastRampMs;
+  unsigned long lastDebugLogMs;
+};
+
+struct NodeMotionCacheSnapshot {
+  bool haveZeroReference;
+  bool haveActiveTarget;
+  float zeroReferenceTurns;
+  float lastRelativeCommandTurns;
+  float lastRelativeCommandDegrees;
+  float lastAbsoluteCommandTurns;
+  unsigned long lastTargetStreamMs;
+};
+
+struct AuxTargetSnapshot {
+  bool joint4HaveTarget;
+  bool joint5HaveTarget;
+  bool joint6HaveTarget;
+  float joint4Deg;
+  float joint5Deg;
+  float joint6Deg;
+  unsigned long joint4LastTxMs;
+  unsigned long joint5LastTxMs;
+  unsigned long joint6LastTxMs;
+};
+
+struct SextetSendResult {
+  bool ok1;
+  bool ok2;
+  bool ok3;
+  bool ok4;
+  bool ok5;
+  bool ok6;
 };
 
 MCP2515 canController(PIN_CAN_CS);
@@ -61,6 +119,25 @@ size_t g_serialLineLen = 0;
 ze300_joint4::State g_joint4State;
 lktech_joint56::State g_joint56State;
 AuxJointTargetState g_auxTargets = {};
+CoordinatedSextetTargetState g_coordinatedSextetTarget = {};
+uint32_t g_nextCoordinatedSextetEpoch = 1;
+bool g_nextCoordinatedSextetAuxFirst = true;
+float g_coordinatedMaxVelocityDps[COORDINATED_JOINT_COUNT] = {
+    DEFAULT_COORDINATED_MAX_VELOCITY_DPS[0],
+    DEFAULT_COORDINATED_MAX_VELOCITY_DPS[1],
+    DEFAULT_COORDINATED_MAX_VELOCITY_DPS[2],
+    DEFAULT_COORDINATED_MAX_VELOCITY_DPS[3],
+    DEFAULT_COORDINATED_MAX_VELOCITY_DPS[4],
+    DEFAULT_COORDINATED_MAX_VELOCITY_DPS[5],
+};
+float g_coordinatedMaxAccelDps2[COORDINATED_JOINT_COUNT] = {
+    DEFAULT_COORDINATED_MAX_ACCEL_DPS2[0],
+    DEFAULT_COORDINATED_MAX_ACCEL_DPS2[1],
+    DEFAULT_COORDINATED_MAX_ACCEL_DPS2[2],
+    DEFAULT_COORDINATED_MAX_ACCEL_DPS2[3],
+    DEFAULT_COORDINATED_MAX_ACCEL_DPS2[4],
+    DEFAULT_COORDINATED_MAX_ACCEL_DPS2[5],
+};
 
 void processIncomingFrames();
 void serviceTargetStreaming();
@@ -78,11 +155,14 @@ void restoreMotionCache(NodeRuntimeState &state,
                         float lastAbsoluteCommandTurns);
 bool sendRemoteRequestToNode(uint8_t nodeId, uint8_t cmd, uint8_t dlc);
 bool sendRelativePositionDegreesToNode(uint8_t nodeId, float relativeDegrees, bool printSummary, bool logCanFrame);
-bool sendJoint4AbsoluteDegrees(float absoluteDegrees, bool printSummary);
+bool sendJoint4RelativeDegrees(float relativeDegrees, bool printSummary);
 bool sendJoint5AbsoluteDegrees(float absoluteDegrees, bool printSummary);
 bool sendJoint6AbsoluteDegrees(float absoluteDegrees, bool printSummary);
 bool handleMoveItBridgeCommand(const char *line);
 bool handleMoveItIdleCommand(const char *line);
+bool handleJointSnapshotRequest(const char *line);
+bool handleAuxJointTestCommand(const char *line);
+bool handleCoordinatedRampConfigCommand(const char *line);
 bool ensureActiveNodeReadyForMotion(const char *reason);
 void runAutomaticBringupAllNodes();
 void clearActiveTargetForNode(uint8_t nodeId, const char *reason);
@@ -92,8 +172,35 @@ bool allNodesHaveBootConfiguration();
 void printBootConfigurationSummary(const char *prefix);
 bool nodeHasActiveFault(const NodeRuntimeState &state);
 void clearFailsafeLatch(NodeRuntimeState &state);
+void clearHeartbeatWarning(NodeRuntimeState &state, bool logRecovery);
+void noteHeartbeatWarning(NodeRuntimeState &state, unsigned long now);
 bool sendAxisStateRequestToNode(uint8_t nodeId, uint32_t state, const char *message, bool logFrame);
 void engageNodeFailsafe(uint8_t nodeId, const char *reason, bool requestIdleIfReachable);
+NodeMotionCacheSnapshot captureMotionCache(const NodeRuntimeState &state);
+void restoreMotionCache(NodeRuntimeState &state, const NodeMotionCacheSnapshot &snapshot);
+AuxTargetSnapshot captureAuxTargetSnapshot();
+void restoreAuxTargetSnapshot(const AuxTargetSnapshot &snapshot);
+void clearCoordinatedSextetTarget();
+void storeCoordinatedSextetTarget(float joint1Deg,
+                                  float joint2Deg,
+                                  float joint3Deg,
+                                  float joint4Deg,
+                                  float joint5Deg,
+                                  float joint6Deg,
+                                  unsigned long lastStreamMs);
+SextetSendResult sendCoordinatedSextetBurst(float joint1Deg,
+                                            float joint2Deg,
+                                            float joint3Deg,
+                                            float joint4Deg,
+                                            float joint5Deg,
+                                            float joint6Deg,
+                                            bool auxGroupFirst);
+bool sextetSendSucceeded(const SextetSendResult &result);
+void printSextetSendResult(const char *prefix, const SextetSendResult &result);
+void printCoordinatedRampLimits();
+bool readJointSnapshot(float *jointDeg, char *errorText, size_t errorTextSize);
+void printJointSnapshot();
+void armAuxJointHoldTargetsAfterBoot();
 
 bool isTrackedNodeId(uint8_t nodeId) {
   return odrive_can_sniffer::isSupportedNodeId(nodeId);
@@ -244,6 +351,245 @@ void restoreMotionCache(NodeRuntimeState &state,
   state.lastAbsoluteCommandTurns = lastAbsoluteCommandTurns;
 }
 
+NodeMotionCacheSnapshot captureMotionCache(const NodeRuntimeState &state) {
+  NodeMotionCacheSnapshot snapshot = {};
+  snapshot.haveZeroReference = state.haveZeroReference;
+  snapshot.haveActiveTarget = state.haveActiveTarget;
+  snapshot.zeroReferenceTurns = state.zeroReferenceTurns;
+  snapshot.lastRelativeCommandTurns = state.lastRelativeCommandTurns;
+  snapshot.lastRelativeCommandDegrees = state.lastRelativeCommandDegrees;
+  snapshot.lastAbsoluteCommandTurns = state.lastAbsoluteCommandTurns;
+  snapshot.lastTargetStreamMs = state.lastTargetStreamMs;
+  return snapshot;
+}
+
+void restoreMotionCache(NodeRuntimeState &state, const NodeMotionCacheSnapshot &snapshot) {
+  restoreMotionCache(state,
+                     snapshot.haveZeroReference,
+                     snapshot.haveActiveTarget,
+                     snapshot.zeroReferenceTurns,
+                     snapshot.lastRelativeCommandTurns,
+                     snapshot.lastRelativeCommandDegrees,
+                     snapshot.lastAbsoluteCommandTurns);
+  state.lastTargetStreamMs = snapshot.lastTargetStreamMs;
+}
+
+AuxTargetSnapshot captureAuxTargetSnapshot() {
+  AuxTargetSnapshot snapshot = {};
+  snapshot.joint4HaveTarget = g_auxTargets.joint4HaveTarget;
+  snapshot.joint5HaveTarget = g_auxTargets.joint5HaveTarget;
+  snapshot.joint6HaveTarget = g_auxTargets.joint6HaveTarget;
+  snapshot.joint4Deg = g_auxTargets.joint4Deg;
+  snapshot.joint5Deg = g_auxTargets.joint5Deg;
+  snapshot.joint6Deg = g_auxTargets.joint6Deg;
+  snapshot.joint4LastTxMs = g_auxTargets.joint4LastTxMs;
+  snapshot.joint5LastTxMs = g_auxTargets.joint5LastTxMs;
+  snapshot.joint6LastTxMs = g_auxTargets.joint6LastTxMs;
+  return snapshot;
+}
+
+void restoreAuxTargetSnapshot(const AuxTargetSnapshot &snapshot) {
+  g_auxTargets.joint4HaveTarget = snapshot.joint4HaveTarget;
+  g_auxTargets.joint5HaveTarget = snapshot.joint5HaveTarget;
+  g_auxTargets.joint6HaveTarget = snapshot.joint6HaveTarget;
+  g_auxTargets.joint4Deg = snapshot.joint4Deg;
+  g_auxTargets.joint5Deg = snapshot.joint5Deg;
+  g_auxTargets.joint6Deg = snapshot.joint6Deg;
+  g_auxTargets.joint4LastTxMs = snapshot.joint4LastTxMs;
+  g_auxTargets.joint5LastTxMs = snapshot.joint5LastTxMs;
+  g_auxTargets.joint6LastTxMs = snapshot.joint6LastTxMs;
+}
+
+void clearCoordinatedSextetTarget() {
+  g_coordinatedSextetTarget.haveTarget = false;
+  g_coordinatedSextetTarget.rampInitialized = false;
+  g_coordinatedSextetTarget.epoch = 0;
+  g_coordinatedSextetTarget.lastStreamMs = 0;
+  g_coordinatedSextetTarget.lastRampMs = 0;
+  g_coordinatedSextetTarget.lastDebugLogMs = 0;
+  for (size_t i = 0; i < COORDINATED_JOINT_COUNT; ++i) {
+    g_coordinatedSextetTarget.velocityDps[i] = 0.0f;
+  }
+}
+
+void storeCoordinatedSextetTarget(float joint1Deg,
+                                  float joint2Deg,
+                                  float joint3Deg,
+                                  float joint4Deg,
+                                  float joint5Deg,
+                                  float joint6Deg,
+                                  unsigned long lastStreamMs) {
+  const bool alreadyStreaming = g_coordinatedSextetTarget.haveTarget;
+  g_coordinatedSextetTarget.haveTarget = true;
+  g_coordinatedSextetTarget.epoch = g_nextCoordinatedSextetEpoch++;
+  g_coordinatedSextetTarget.joint1Deg = joint1Deg;
+  g_coordinatedSextetTarget.joint2Deg = joint2Deg;
+  g_coordinatedSextetTarget.joint3Deg = joint3Deg;
+  g_coordinatedSextetTarget.joint4Deg = joint4Deg;
+  g_coordinatedSextetTarget.joint5Deg = joint5Deg;
+  g_coordinatedSextetTarget.joint6Deg = joint6Deg;
+  if (!alreadyStreaming) {
+    g_coordinatedSextetTarget.lastStreamMs = 0;
+  }
+  if (!g_coordinatedSextetTarget.rampInitialized) {
+    NodeRuntimeState *state10 = lookupNodeState(NODE_ID_10);
+    NodeRuntimeState *state11 = lookupNodeState(NODE_ID_11);
+    NodeRuntimeState *state12 = lookupNodeState(NODE_ID_12);
+    g_coordinatedSextetTarget.commandedDeg[0] =
+        state10 != nullptr && state10->haveActiveTarget ? state10->lastRelativeCommandDegrees : 0.0f;
+    g_coordinatedSextetTarget.commandedDeg[1] =
+        state11 != nullptr && state11->haveActiveTarget ? state11->lastRelativeCommandDegrees : 0.0f;
+    g_coordinatedSextetTarget.commandedDeg[2] =
+        state12 != nullptr && state12->haveActiveTarget ? state12->lastRelativeCommandDegrees : 0.0f;
+    g_coordinatedSextetTarget.commandedDeg[3] =
+        g_auxTargets.joint4HaveTarget ? g_auxTargets.joint4Deg : 0.0f;
+    g_coordinatedSextetTarget.commandedDeg[4] =
+        g_auxTargets.joint5HaveTarget ? g_auxTargets.joint5Deg : 0.0f;
+    g_coordinatedSextetTarget.commandedDeg[5] =
+        g_auxTargets.joint6HaveTarget ? g_auxTargets.joint6Deg : 0.0f;
+    g_coordinatedSextetTarget.rampInitialized = true;
+    g_coordinatedSextetTarget.lastRampMs = lastStreamMs;
+    for (size_t i = 0; i < COORDINATED_JOINT_COUNT; ++i) {
+      g_coordinatedSextetTarget.velocityDps[i] = 0.0f;
+    }
+  }
+}
+
+float stepRampLimited(float currentDeg,
+                      float targetDeg,
+                      float *velocityDps,
+                      float maxVelocityDps,
+                      float maxAccelDps2,
+                      float dtSec) {
+  const float errorDeg = targetDeg - currentDeg;
+  if (fabs(errorDeg) <= 0.0005f && fabs(*velocityDps) <= 0.0005f) {
+    *velocityDps = 0.0f;
+    return targetDeg;
+  }
+
+  const float direction = errorDeg >= 0.0f ? 1.0f : -1.0f;
+  const float stoppingSpeed = sqrtf(fmaxf(0.0f, 2.0f * maxAccelDps2 * fabs(errorDeg)));
+  const float desiredVelocity = direction * fminf(maxVelocityDps, stoppingSpeed);
+  const float maxVelocityStep = maxAccelDps2 * dtSec;
+
+  if (desiredVelocity > *velocityDps) {
+    *velocityDps = fminf(desiredVelocity, *velocityDps + maxVelocityStep);
+  } else {
+    *velocityDps = fmaxf(desiredVelocity, *velocityDps - maxVelocityStep);
+  }
+
+  float nextDeg = currentDeg + (*velocityDps) * dtSec;
+  const float remainingAfterStep = targetDeg - nextDeg;
+  if (errorDeg == 0.0f || errorDeg * remainingAfterStep <= 0.0f) {
+    *velocityDps = 0.0f;
+    return targetDeg;
+  }
+  return nextDeg;
+}
+
+void updateCoordinatedRampedCommand(unsigned long now) {
+  if (!g_coordinatedSextetTarget.rampInitialized) {
+    return;
+  }
+
+  unsigned long dtMs = now - g_coordinatedSextetTarget.lastRampMs;
+  if (dtMs == 0) {
+    dtMs = TARGET_STREAM_INTERVAL_MS;
+  }
+  if (dtMs > 250) {
+    dtMs = 250;
+  }
+  const float dtSec = static_cast<float>(dtMs) / 1000.0f;
+  g_coordinatedSextetTarget.lastRampMs = now;
+
+  const float targets[COORDINATED_JOINT_COUNT] = {
+      g_coordinatedSextetTarget.joint1Deg,
+      g_coordinatedSextetTarget.joint2Deg,
+      g_coordinatedSextetTarget.joint3Deg,
+      g_coordinatedSextetTarget.joint4Deg,
+      g_coordinatedSextetTarget.joint5Deg,
+      g_coordinatedSextetTarget.joint6Deg,
+  };
+  for (size_t i = 0; i < COORDINATED_JOINT_COUNT; ++i) {
+    g_coordinatedSextetTarget.commandedDeg[i] = stepRampLimited(
+        g_coordinatedSextetTarget.commandedDeg[i],
+        targets[i],
+        &g_coordinatedSextetTarget.velocityDps[i],
+        g_coordinatedMaxVelocityDps[i],
+        g_coordinatedMaxAccelDps2[i],
+        dtSec);
+  }
+}
+
+SextetSendResult sendCoordinatedSextetBurst(float joint1Deg,
+                                            float joint2Deg,
+                                            float joint3Deg,
+                                            float joint4Deg,
+                                            float joint5Deg,
+                                            float joint6Deg,
+                                            bool auxGroupFirst) {
+  SextetSendResult result = {true, true, true, true, true, true};
+
+  auto sendOdriveGroup = [&]() {
+    result.ok1 = sendRelativePositionDegreesToNode(NODE_ID_10, joint1Deg, false, false);
+    result.ok2 = sendRelativePositionDegreesToNode(NODE_ID_11, joint2Deg, false, false);
+    result.ok3 = sendRelativePositionDegreesToNode(NODE_ID_12, joint3Deg, false, false);
+  };
+
+  auto sendAuxGroup = [&]() {
+    result.ok4 = sendJoint4RelativeDegrees(joint4Deg, false);
+    result.ok5 = sendJoint5AbsoluteDegrees(joint5Deg, false);
+    result.ok6 = sendJoint6AbsoluteDegrees(joint6Deg, false);
+  };
+
+  // Drain pending telemetry/replies first so the six-command burst starts from
+  // a clean RX state.  The burst itself is split into two three-frame groups so
+  // we never overfill the MCP2515's three TX buffers.
+  processIncomingFrames();
+
+  // Minimize inter-group gap to reduce temporal skew between joint groups.
+  // 1 ms is enough for the MCP2515 to shift TXB0-TXB2 onto the wire (~0.3 ms
+  // per SPI transaction at 10 MHz) without accumulating visible stagger.
+  if (auxGroupFirst) {
+    sendAuxGroup();
+    delay(1);
+    sendOdriveGroup();
+  } else {
+    sendOdriveGroup();
+    delay(1);
+    sendAuxGroup();
+  }
+
+  // Quick drain — 1 ms is enough for any reply frames triggered by the burst
+  // to land in RXB0/RXB1 without adding to the next cycle's backlog.
+  delay(1);
+  processIncomingFrames();
+  return result;
+}
+
+bool sextetSendSucceeded(const SextetSendResult &result) {
+  return result.ok1 && result.ok2 && result.ok3 &&
+         result.ok4 && result.ok5 && result.ok6;
+}
+
+void printSextetSendResult(const char *prefix, const SextetSendResult &result) {
+  if (prefix != nullptr && prefix[0] != '\0') {
+    Serial.print(prefix);
+  }
+  Serial.print("joint1=");
+  Serial.print(result.ok1 ? "ok" : "fail");
+  Serial.print(" joint2=");
+  Serial.print(result.ok2 ? "ok" : "fail");
+  Serial.print(" joint3=");
+  Serial.print(result.ok3 ? "ok" : "fail");
+  Serial.print(" joint4=");
+  Serial.print(result.ok4 ? "ok" : "fail");
+  Serial.print(" joint5=");
+  Serial.print(result.ok5 ? "ok" : "fail");
+  Serial.print(" joint6=");
+  Serial.println(result.ok6 ? "ok" : "fail");
+}
+
 // -----------------------------
 // CAN / MCP2515 configuration
 // -----------------------------
@@ -361,9 +707,7 @@ void printCachedAxisStatus(const char *prefix) {
 bool nodeHasBootConfiguration(const NodeRuntimeState &state) {
   return state.haveZeroReference &&
          state.haveLatestEncoderEstimate &&
-         state.haveHeartbeat &&
-         state.lastAxisState == AXIS_STATE_CLOSED_LOOP_CONTROL &&
-         state.lastHeartbeatActiveErrors == 0;
+         nodeIsInClosedLoop(state);
 }
 
 bool allNodesHaveBootConfiguration() {
@@ -397,6 +741,49 @@ void clearFailsafeLatch(NodeRuntimeState &state) {
   state.lastFailsafeMs = 0;
 }
 
+void clearHeartbeatWarning(NodeRuntimeState &state, bool logRecovery) {
+  if (!state.heartbeatWarningActive) {
+    return;
+  }
+
+  state.heartbeatWarningActive = false;
+  state.lastHeartbeatWarningLogMs = 0;
+
+  if (logRecovery) {
+    Serial.print("Heartbeat warning cleared for node 0x");
+    printHexByte(state.nodeId);
+    Serial.println();
+  }
+}
+
+void noteHeartbeatWarning(NodeRuntimeState &state, unsigned long now) {
+  if (!state.haveHeartbeat || nodeHeartbeatIsHardTimedOut(state, now)) {
+    return;
+  }
+
+  if (!state.heartbeatWarningActive) {
+    state.heartbeatWarningActive = true;
+    state.lastHeartbeatWarningLogMs = 0;
+  }
+
+  if (state.lastHeartbeatWarningLogMs != 0 &&
+      now - state.lastHeartbeatWarningLogMs < HEARTBEAT_WARNING_LOG_INTERVAL_MS) {
+    return;
+  }
+
+  state.lastHeartbeatWarningLogMs = now;
+
+  Serial.print("WARNING: ODrive heartbeat degraded node=0x");
+  printHexByte(state.nodeId);
+  Serial.print(" age_ms=");
+  Serial.print(heartbeatAgeMs(state, now));
+  Serial.print(" axis=");
+  Serial.print(axisStateName(state.lastAxisState));
+  Serial.print(" heartbeat_errors=0x");
+  Serial.print(state.lastHeartbeatActiveErrors, HEX);
+  Serial.println(" continuing Set_Input_Pos streaming");
+}
+
 void printBootConfigurationSummary(const char *prefix) {
   if (prefix != nullptr && prefix[0] != '\0') {
     Serial.println(prefix);
@@ -404,6 +791,7 @@ void printBootConfigurationSummary(const char *prefix) {
 
   for (size_t i = 0; i < SUPPORTED_NODE_COUNT; ++i) {
     const NodeRuntimeState &state = g_nodeStates[i];
+    const unsigned long now = millis();
     Serial.print("  node 0x");
     printHexByte(state.nodeId);
     Serial.print(" zero=");
@@ -411,7 +799,13 @@ void printBootConfigurationSummary(const char *prefix) {
     Serial.print(" encoder=");
     Serial.print(state.haveLatestEncoderEstimate ? "yes" : "no");
     Serial.print(" heartbeat=");
-    Serial.print(state.haveHeartbeat ? "yes" : "no");
+    Serial.print(heartbeatStateName(state, now));
+    Serial.print(" hb_age_ms=");
+    if (state.haveHeartbeat) {
+      Serial.print(heartbeatAgeMs(state, now));
+    } else {
+      Serial.print("n/a");
+    }
     Serial.print(" axis=");
     Serial.print(axisStateName(state.lastAxisState));
     Serial.print(" failsafe=");
@@ -509,6 +903,8 @@ void engageNodeFailsafe(uint8_t nodeId, const char *reason, bool requestIdleIfRe
     return;
   }
 
+  clearCoordinatedSextetTarget();
+  clearHeartbeatWarning(*state, false);
   state->failsafeLatched = true;
   state->lastFailsafeMs = millis();
   state->haveActiveTarget = false;
@@ -523,7 +919,7 @@ void engageNodeFailsafe(uint8_t nodeId, const char *reason, bool requestIdleIfRe
 
   const bool recentlyReachable =
       state->haveHeartbeat &&
-      millis() - state->lastHeartbeatMs <= HEARTBEAT_STALE_TIMEOUT_MS;
+      !nodeHeartbeatIsHardTimedOut(*state, millis());
   if (requestIdleIfReachable && recentlyReachable && modeAllowsTransmit(g_mode)) {
     (void)sendAxisStateRequestToNode(nodeId, AXIS_STATE_IDLE, "Failsafe requested IDLE", true);
   }
@@ -568,6 +964,7 @@ void decodeHeartbeat(NodeRuntimeState &state, const can_frame &frame) {
   state.lastHeartbeatActiveErrors = activeErrors;
   state.lastAxisState = axisState;
   state.lastHeartbeatMs = millis();
+  clearHeartbeatWarning(state, true);
 
   if (axisState == AXIS_STATE_CLOSED_LOOP_CONTROL && activeErrors == 0 && state.haveLatestEncoderEstimate) {
     clearFailsafeLatch(state);
@@ -809,6 +1206,7 @@ void sendSelfTestFrame() {
 
 void captureZeroFromLatestPosition() {
   NodeRuntimeState &state = selectedNodeState();
+  clearCoordinatedSextetTarget();
 
   if (!state.haveLatestEncoderEstimate) {
     Serial.println("Cannot set zero yet: no encoder estimate received. Wait for 0x249 or send 'e'.");
@@ -835,6 +1233,7 @@ void captureZeroFromLatestPosition() {
 
 void sendRelativePositionTurns(float relativeTurns) {
   NodeRuntimeState &state = selectedNodeState();
+  clearCoordinatedSextetTarget();
 
   if (!ensureActiveNodeReadyForMotion("turn command")) {
     Serial.println("Cannot send relative turns: automatic bringup did not complete.");
@@ -871,6 +1270,7 @@ void sendRelativePositionTurns(float relativeTurns) {
 
 void sendRelativePositionDegrees(float relativeDegrees) {
   NodeRuntimeState &state = selectedNodeState();
+  clearCoordinatedSextetTarget();
 
   if (!ensureActiveNodeReadyForMotion("angle command")) {
     Serial.println("Cannot send relative angle: automatic bringup did not complete.");
@@ -968,11 +1368,11 @@ bool sendRelativePositionDegreesToNode(uint8_t nodeId,
   return true;
 }
 
-bool sendJoint4AbsoluteDegrees(float absoluteDegrees, bool printSummary) {
-  if (absoluteDegrees < JOINT4_MIN_DEG || absoluteDegrees > JOINT4_MAX_DEG) {
+bool sendJoint4RelativeDegrees(float relativeDegrees, bool printSummary) {
+  if (relativeDegrees < JOINT4_MIN_DEG || relativeDegrees > JOINT4_MAX_DEG) {
     if (printSummary) {
-      Serial.print("Rejected joint4 absolute target ");
-      Serial.print(absoluteDegrees, 3);
+      Serial.print("Rejected joint4 relative target ");
+      Serial.print(relativeDegrees, 3);
       Serial.print(" deg outside limits [");
       Serial.print(JOINT4_MIN_DEG, 1);
       Serial.print(", ");
@@ -982,22 +1382,42 @@ bool sendJoint4AbsoluteDegrees(float absoluteDegrees, bool printSummary) {
     return false;
   }
 
-  if (!g_joint4State.speedConfigured && !ze300_joint4::initialize(canController, g_joint4State)) {
+  // Speed and software zero must have been configured at boot (setup()).  Do NOT call
+  // ze300_joint4::initialize() here — it blocks for up to 1750 ms
+  // (5 retries × 250 ms waitForReply + inter-retry delays), which stalls
+  // the coordinated sextet burst while other joints already have CAN frames
+  // in flight, creating dangerous split-motion.
+  if (!g_joint4State.speedConfigured || !g_joint4State.haveSoftwareZero) {
     if (printSummary) {
-      Serial.println("joint4 ZE300 speed init failed");
+      Serial.println("joint4 ZE300 speed/software zero not configured at boot — cannot command in hot path");
     }
     return false;
   }
 
-  const bool ok = ze300_joint4::sendAbsoluteDegrees(canController, g_joint4State, absoluteDegrees);
+  if (!g_auxTargets.joint4HaveTarget && fabs(relativeDegrees) > JOINT4_FIRST_COMMAND_MAX_DEG) {
+    if (printSummary) {
+      Serial.print("Rejected first joint4 relative target ");
+      Serial.print(relativeDegrees, 3);
+      Serial.print(" deg; first command limit is +/-");
+      Serial.print(JOINT4_FIRST_COMMAND_MAX_DEG, 1);
+      Serial.println(" deg from captured software zero");
+    }
+    return false;
+  }
+
+  const bool ok = ze300_joint4::sendRelativeDegrees(canController, g_joint4State, relativeDegrees);
   if (ok) {
     g_auxTargets.joint4HaveTarget = true;
-    g_auxTargets.joint4Deg = absoluteDegrees;
+    g_auxTargets.joint4Deg = relativeDegrees;
     g_auxTargets.joint4LastTxMs = millis();
   }
   if (printSummary) {
-    Serial.print("Joint4 target=");
-    Serial.print(absoluteDegrees, 3);
+    Serial.print("Joint4 relative target=");
+    Serial.print(relativeDegrees, 3);
+    Serial.print(" deg zero=");
+    Serial.print(g_joint4State.zeroOffsetDeg, 3);
+    Serial.print(" abs=");
+    Serial.print(g_joint4State.lastAbsoluteDeg, 3);
     Serial.print(" deg send=");
     Serial.println(ok ? "ok" : "fail");
   }
@@ -1157,9 +1577,9 @@ bool handleMoveItBridgeCommand(const char *line) {
   }
 
   if (is_sextet) {
-    const NodeRuntimeState *state10 = lookupNodeState(NODE_ID_10);
-    const NodeRuntimeState *state11 = lookupNodeState(NODE_ID_11);
-    const NodeRuntimeState *state12 = lookupNodeState(NODE_ID_12);
+    NodeRuntimeState *state10 = lookupNodeState(NODE_ID_10);
+    NodeRuntimeState *state11 = lookupNodeState(NODE_ID_11);
+    NodeRuntimeState *state12 = lookupNodeState(NODE_ID_12);
     const bool preflightOk =
         state10 != nullptr && state11 != nullptr && state12 != nullptr &&
         nodeIsReadyForMotion(*state10) &&
@@ -1177,7 +1597,35 @@ bool handleMoveItBridgeCommand(const char *line) {
       Serial.println("MoveIt sextet rejected by preflight check.");
       return true;
     }
+
+    // Ginkgo pattern: store the target, let serviceTargetStreaming() send CAN
+    // at 20 Hz.  The old code called sendCoordinatedSextetBurst() here on every
+    // serial command (50 Hz from the bridge) PLUS re-streamed at 20 Hz —
+    // producing ~420 CAN frames/sec which overwhelmed the MCP2515's 3 TX
+    // buffers, causing ERROR_FAILTX cascading into bus-off.
+    const unsigned long committedMs = millis();
+    storeCoordinatedSextetTarget(joint1Deg, joint2Deg, joint3Deg,
+                                 joint4Deg, joint5Deg, joint6Deg,
+                                 committedMs);
+
+    Serial.print("j6 received; target updated epoch=");
+    Serial.print(g_coordinatedSextetTarget.epoch);
+    Serial.print(": joint1=");
+    Serial.print(joint1Deg, 3);
+    Serial.print(" joint2=");
+    Serial.print(joint2Deg, 3);
+    Serial.print(" joint3=");
+    Serial.print(joint3Deg, 3);
+    Serial.print(" joint4=");
+    Serial.print(joint4Deg, 3);
+    Serial.print(" joint5=");
+    Serial.print(joint5Deg, 3);
+    Serial.print(" joint6=");
+    Serial.println(joint6Deg, 3);
+    return true;
   }
+
+  clearCoordinatedSextetTarget();
 
   // Drain RX buffers before sending to all joints. ODrive encoder estimates
   // and LKTech/ZE300 replies accumulate during the ~1 ms of sequential SPI
@@ -1187,29 +1635,9 @@ bool handleMoveItBridgeCommand(const char *line) {
   const bool ok1 = sendRelativePositionDegreesToNode(NODE_ID_10, joint1Deg, false, false);
   const bool ok2 = sendRelativePositionDegreesToNode(NODE_ID_11, joint2Deg, false, false);
   const bool ok3 = sendRelativePositionDegreesToNode(NODE_ID_12, joint3Deg, false, false);
-  const bool ok4 = (is_quartet || is_sextet) ? sendJoint4AbsoluteDegrees(joint4Deg, false) : true;
-
-  if (is_sextet) {
-    // The 3 ODrive frames + ZE300 frame may still be occupying all 3 TX
-    // buffers at this point. A 2 ms pause ensures TXB0/1/2 have drained
-    // (3 × ~110 µs CAN frame time) before the LKTech frames are loaded,
-    // preventing ERROR_ALLTXBUSY on the joint5/joint6 sendMessage calls.
-    delay(2);
-  }
-
-  const bool ok5 = is_sextet ? sendJoint5AbsoluteDegrees(joint5Deg, false) : true;
-  const bool ok6 = is_sextet ? sendJoint6AbsoluteDegrees(joint6Deg, false) : true;
-
-  if (is_sextet) {
-    // LKTech motors reply to each 0xA4 position command within ~2 ms using
-    // the same CAN ID (0x14E / 0x14F). If those replies are still in flight
-    // when the next sextet's joint5/6 commands are sent, both sides transmit
-    // frames with identical CAN IDs; the data bytes differ, causing a bit
-    // error in the data phase (not an arbitration loss) which sets TXERR.
-    // A 5 ms wait + drain consumes the replies before the next command cycle.
-    delay(5);
-    processIncomingFrames();
-  }
+  const bool ok4 = is_quartet ? sendJoint4RelativeDegrees(joint4Deg, false) : true;
+  const bool ok5 = true;
+  const bool ok6 = true;
 
   if (!(ok1 && ok2 && ok3 && ok4 && ok5 && ok6)) {
     Serial.print(is_sextet ? "MoveIt sextet partially applied: joint1=" :
@@ -1267,8 +1695,21 @@ bool handleMoveItIdleCommand(const char *line) {
   sendAxisStateRequestToNode(NODE_ID_10, AXIS_STATE_IDLE, nullptr, false);
   sendAxisStateRequestToNode(NODE_ID_11, AXIS_STATE_IDLE, nullptr, false);
   sendAxisStateRequestToNode(NODE_ID_12, AXIS_STATE_IDLE, nullptr, false);
+  NodeRuntimeState *state10 = lookupNodeState(NODE_ID_10);
+  NodeRuntimeState *state11 = lookupNodeState(NODE_ID_11);
+  NodeRuntimeState *state12 = lookupNodeState(NODE_ID_12);
+  if (state10 != nullptr) {
+    state10->haveActiveTarget = false;
+  }
+  if (state11 != nullptr) {
+    state11->haveActiveTarget = false;
+  }
+  if (state12 != nullptr) {
+    state12->haveActiveTarget = false;
+  }
   const bool ze300_ok = ze300_joint4::disable(canController);
   const bool lk_ok = lktech_joint56::stopAll(canController, g_joint56State);
+  clearCoordinatedSextetTarget();
   g_auxTargets.joint4HaveTarget = false;
   g_auxTargets.joint5HaveTarget = false;
   g_auxTargets.joint6HaveTarget = false;
@@ -1281,12 +1722,21 @@ bool handleMoveItIdleCommand(const char *line) {
 
 void printMotionState() {
   const NodeRuntimeState &state = selectedNodeState();
+  const unsigned long now = millis();
   const float relativeTurnsFromZero = state.lastEncoderPosTurns - state.zeroReferenceTurns;
   const float relativeJointDegrees = motorTurnsToJointDegrees(g_activeNodeId, relativeTurnsFromZero);
   Serial.print("motion node=0x");
   printHexByte(g_activeNodeId);
   Serial.print(" axis_state=");
   Serial.print(axisStateName(state.lastAxisState));
+  Serial.print(" heartbeat_state=");
+  Serial.print(heartbeatStateName(state, now));
+  Serial.print(" heartbeat_age_ms=");
+  if (state.haveHeartbeat) {
+    Serial.print(heartbeatAgeMs(state, now));
+  } else {
+    Serial.print("n/a");
+  }
   Serial.print(" heartbeat_errors=0x");
   Serial.print(state.lastHeartbeatActiveErrors, HEX);
   Serial.print(" disarm=0x");
@@ -1324,11 +1774,322 @@ void printMotionState() {
   Serial.println(state.lastAbsoluteCommandTurns, 6);
 }
 
+bool waitForFreshOdriveEncoder(NodeRuntimeState &state, unsigned long requestStartMs) {
+  if (!sendRemoteRequestToNode(state.nodeId, CMD_GET_ENCODER_ESTIMATES, 8)) {
+    return false;
+  }
+
+  const unsigned long deadlineMs = millis() + JS6_SNAPSHOT_TIMEOUT_MS;
+  while (millis() <= deadlineMs) {
+    processIncomingFrames();
+    if (state.haveLatestEncoderEstimate && state.lastEncoderEstimateMs >= requestStartMs) {
+      return true;
+    }
+    delay(2);
+  }
+  return false;
+}
+
+bool readJointSnapshot(float *jointDeg, char *errorText, size_t errorTextSize) {
+  if (jointDeg == nullptr || errorText == nullptr || errorTextSize == 0) {
+    return false;
+  }
+  errorText[0] = '\0';
+
+  for (size_t index = 0; index < SUPPORTED_NODE_COUNT; ++index) {
+    NodeRuntimeState &state = g_nodeStates[index];
+    if (!state.haveZeroReference) {
+      snprintf(errorText, errorTextSize, "odrive_node_0x%02X_no_zero", state.nodeId);
+      return false;
+    }
+
+    const unsigned long requestStartMs = millis();
+    if (!waitForFreshOdriveEncoder(state, requestStartMs)) {
+      snprintf(errorText, errorTextSize, "odrive_node_0x%02X_no_fresh_encoder", state.nodeId);
+      return false;
+    }
+
+    const float relativeTurns = state.lastEncoderPosTurns - state.zeroReferenceTurns;
+    jointDeg[index] = motorTurnsToJointDegrees(state.nodeId, relativeTurns);
+  }
+
+  if (!g_joint4State.haveSoftwareZero) {
+    snprintf(errorText, errorTextSize, "joint4_no_software_zero");
+    return false;
+  }
+  if (!ze300_joint4::readAbsolutePosition(canController, g_joint4State)) {
+    snprintf(errorText, errorTextSize, "joint4_read_failed");
+    return false;
+  }
+  jointDeg[3] = static_cast<float>(g_joint4State.lastRelativeDeg);
+
+  for (size_t index = 0; index < 2; ++index) {
+    if (!g_joint56State.joints[index].haveZero) {
+      snprintf(errorText, errorTextSize, "joint%u_no_zero", static_cast<unsigned>(index + 5));
+      return false;
+    }
+
+    double motorAngleDeg = 0.0;
+    if (!lktech_joint56::readCurrentMotorAngle(canController, g_joint56State, index, &motorAngleDeg)) {
+      snprintf(errorText, errorTextSize, "joint%u_read_failed", static_cast<unsigned>(index + 5));
+      return false;
+    }
+    jointDeg[index + 4] = static_cast<float>(
+        motorAngleDeg - g_joint56State.joints[index].zeroMotorDeg);
+  }
+
+  return true;
+}
+
+void printJointSnapshot() {
+  float jointDeg[6] = {};
+  char errorText[64] = {};
+  if (!readJointSnapshot(jointDeg, errorText, sizeof(errorText))) {
+    Serial.print("js6err ");
+    Serial.println(errorText[0] != '\0' ? errorText : "snapshot_failed");
+    return;
+  }
+
+  Serial.print("js6");
+  for (size_t i = 0; i < 6; ++i) {
+    Serial.print(' ');
+    Serial.print(jointDeg[i], 3);
+  }
+  Serial.println();
+}
+
+bool handleJointSnapshotRequest(const char *line) {
+  if (line == nullptr || strcmp(line, "qjs6") != 0) {
+    return false;
+  }
+  printJointSnapshot();
+  return true;
+}
+
+void armAuxJointHoldTargetsAfterBoot() {
+  if (g_joint4State.speedConfigured && g_joint4State.haveSoftwareZero) {
+    if (sendJoint4RelativeDegrees(0.0f, false)) {
+      Serial.println("joint4 hold target armed at relative zero");
+    } else {
+      Serial.println("joint4 hold target failed after zero capture");
+    }
+  } else {
+    Serial.println("joint4 hold target skipped: zero/speed not configured");
+  }
+
+  if (g_joint56State.joints[0].haveZero) {
+    if (sendJoint5AbsoluteDegrees(0.0f, false)) {
+      Serial.println("joint5 hold target armed at relative zero");
+    } else {
+      Serial.println("joint5 hold target failed after zero capture");
+    }
+  } else {
+    Serial.println("joint5 hold target skipped: zero not captured");
+  }
+
+  if (g_joint56State.joints[1].haveZero) {
+    if (sendJoint6AbsoluteDegrees(0.0f, false)) {
+      Serial.println("joint6 hold target armed at relative zero");
+    } else {
+      Serial.println("joint6 hold target failed after zero capture");
+    }
+  } else {
+    Serial.println("joint6 hold target skipped: zero not captured");
+  }
+}
+
+bool parseSingleFloatArgument(const char *text, float *value) {
+  if (text == nullptr || value == nullptr) {
+    return false;
+  }
+  while (*text == ' ' || *text == '\t') {
+    ++text;
+  }
+  if (*text == '\0') {
+    return false;
+  }
+  char *endPtr = nullptr;
+  const float parsed = strtof(text, &endPtr);
+  if (endPtr == text || !isfinite(parsed)) {
+    return false;
+  }
+  while (*endPtr == ' ' || *endPtr == '\t') {
+    ++endPtr;
+  }
+  if (*endPtr != '\0') {
+    return false;
+  }
+  *value = parsed;
+  return true;
+}
+
+bool handleAuxJointTestCommand(const char *line) {
+  if (line == nullptr) {
+    return false;
+  }
+
+  uint8_t joint = 0;
+  const char *argText = nullptr;
+  if (strncmp(line, "tj4 ", 4) == 0) {
+    joint = 4;
+    argText = line + 4;
+  } else if (strncmp(line, "tj5 ", 4) == 0) {
+    joint = 5;
+    argText = line + 4;
+  } else if (strncmp(line, "tj6 ", 4) == 0) {
+    joint = 6;
+    argText = line + 4;
+  } else {
+    return false;
+  }
+
+  if (g_coordinatedSextetTarget.haveTarget) {
+    Serial.print("err tj");
+    Serial.print(joint);
+    Serial.println(" moveit_active");
+    return true;
+  }
+
+  float targetDeg = 0.0f;
+  if (!parseSingleFloatArgument(argText, &targetDeg)) {
+    Serial.print("err tj");
+    Serial.print(joint);
+    Serial.println(" invalid_number");
+    return true;
+  }
+
+  bool ok = false;
+  const char *rejectReason = nullptr;
+  if (joint == 4) {
+    if (targetDeg < JOINT4_MIN_DEG || targetDeg > JOINT4_MAX_DEG) {
+      rejectReason = "out_of_range";
+    } else if (!g_joint4State.speedConfigured || !g_joint4State.haveSoftwareZero) {
+      rejectReason = "not_ready";
+    } else {
+      ok = sendJoint4RelativeDegrees(targetDeg, false);
+    }
+  } else if (joint == 5) {
+    if (targetDeg < JOINT5_MIN_DEG || targetDeg > JOINT5_MAX_DEG) {
+      rejectReason = "out_of_range";
+    } else if (!g_joint56State.joints[0].haveZero) {
+      rejectReason = "not_ready";
+    } else {
+      ok = sendJoint5AbsoluteDegrees(targetDeg, false);
+    }
+  } else if (joint == 6) {
+    if (targetDeg < JOINT6_MIN_DEG || targetDeg > JOINT6_MAX_DEG) {
+      rejectReason = "out_of_range";
+    } else if (!g_joint56State.joints[1].haveZero) {
+      rejectReason = "not_ready";
+    } else {
+      ok = sendJoint6AbsoluteDegrees(targetDeg, false);
+    }
+  }
+
+  Serial.print(ok ? "ok tj" : "err tj");
+  Serial.print(joint);
+  if (ok) {
+    Serial.print(" target=");
+    Serial.println(targetDeg, 3);
+  } else {
+    Serial.print(' ');
+    Serial.println(rejectReason != nullptr ? rejectReason : "send_failed");
+  }
+  return true;
+}
+
+bool parseSixFloatArguments(const char *text, float *values) {
+  if (text == nullptr || values == nullptr) {
+    return false;
+  }
+  char buffer[SERIAL_LINE_BUFFER_SIZE] = {};
+  strncpy(buffer, text, sizeof(buffer) - 1);
+  char *savePtr = nullptr;
+  for (size_t i = 0; i < COORDINATED_JOINT_COUNT; ++i) {
+    char *token = strtok_r(i == 0 ? buffer : nullptr, " \t", &savePtr);
+    if (token == nullptr) {
+      return false;
+    }
+    char *endPtr = nullptr;
+    values[i] = strtof(token, &endPtr);
+    if (endPtr == token || *endPtr != '\0' || !isfinite(values[i])) {
+      return false;
+    }
+  }
+  return strtok_r(nullptr, " \t", &savePtr) == nullptr;
+}
+
+void printCoordinatedRampLimits() {
+  Serial.print("ramp_limits velocity_dps=");
+  for (size_t i = 0; i < COORDINATED_JOINT_COUNT; ++i) {
+    if (i > 0) {
+      Serial.print(',');
+    }
+    Serial.print(g_coordinatedMaxVelocityDps[i], 3);
+  }
+  Serial.print(" accel_dps2=");
+  for (size_t i = 0; i < COORDINATED_JOINT_COUNT; ++i) {
+    if (i > 0) {
+      Serial.print(',');
+    }
+    Serial.print(g_coordinatedMaxAccelDps2[i], 3);
+  }
+  Serial.println();
+}
+
+bool handleCoordinatedRampConfigCommand(const char *line) {
+  if (line == nullptr) {
+    return false;
+  }
+
+  bool isVelocity = false;
+  bool isAccel = false;
+  const char *argText = nullptr;
+  if (strncmp(line, "rv6 ", 4) == 0) {
+    isVelocity = true;
+    argText = line + 4;
+  } else if (strncmp(line, "ra6 ", 4) == 0) {
+    isAccel = true;
+    argText = line + 4;
+  } else if (strcmp(line, "rl6") == 0) {
+    printCoordinatedRampLimits();
+    return true;
+  } else {
+    return false;
+  }
+
+  float values[COORDINATED_JOINT_COUNT] = {};
+  if (!parseSixFloatArguments(argText, values)) {
+    Serial.println(isVelocity
+        ? "err rv6 invalid_numbers; usage: rv6 <j1> <j2> <j3> <j4> <j5> <j6>"
+        : "err ra6 invalid_numbers; usage: ra6 <j1> <j2> <j3> <j4> <j5> <j6>");
+    return true;
+  }
+  for (size_t i = 0; i < COORDINATED_JOINT_COUNT; ++i) {
+    if (values[i] <= 0.0f) {
+      Serial.println(isVelocity ? "err rv6 non_positive" : "err ra6 non_positive");
+      return true;
+    }
+  }
+
+  for (size_t i = 0; i < COORDINATED_JOINT_COUNT; ++i) {
+    if (isVelocity) {
+      g_coordinatedMaxVelocityDps[i] = values[i];
+    } else if (isAccel) {
+      g_coordinatedMaxAccelDps2[i] = values[i];
+    }
+  }
+  Serial.println(isVelocity ? "ok rv6" : "ok ra6");
+  printCoordinatedRampLimits();
+  return true;
+}
+
 // -----------------------------
 // UI / commands
 // -----------------------------
 void printConfig() {
   const NodeRuntimeState &state = selectedNodeState();
+  const unsigned long now = millis();
   Serial.print("config node=0x");
   printHexByte(g_activeNodeId);
   Serial.print(" bitrate=");
@@ -1356,12 +2117,21 @@ void printConfig() {
   Serial.print("]");
   Serial.print(" stream=");
   Serial.print(g_streamLastTarget ? "on" : "off");
+  Serial.print(" heartbeat=");
+  Serial.print(heartbeatStateName(state, now));
+  Serial.print(" hb_age_ms=");
+  if (state.haveHeartbeat) {
+    Serial.print(heartbeatAgeMs(state, now));
+  } else {
+    Serial.print("n/a");
+  }
   Serial.print(" have_target=");
   Serial.print(state.haveActiveTarget ? "yes" : "no");
   Serial.print(" have_encoder=");
   Serial.print(state.haveLatestEncoderEstimate ? "yes" : "no");
   Serial.print(" failsafe=");
   Serial.println(state.failsafeLatched ? "yes" : "no");
+  printCoordinatedRampLimits();
 }
 
 void printHelp() {
@@ -1386,8 +2156,13 @@ void printHelp() {
   Serial.println("  f      : print failsafe-aware status for all nodes");
   Serial.println("  g <n>  : send relative joint angle in degrees from zero");
   Serial.println("  j a b c: set joints 1-3 together in degrees (MoveIt bridge)");
-  Serial.println("  j4 a b c d: set joints 1-4 together, with joint4 absolute ZE300 degrees");
+  Serial.println("  j4 a b c d: set joints 1-4 together; joint4 is relative to ZE300 software zero");
   Serial.println("  j6 a b c d e f: set joints 1-6 together (MoveIt bridge)");
+  Serial.println("  qjs6   : query real measured joint snapshot; replies js6 or js6err");
+  Serial.println("  rl6    : print coordinated firmware ramp limits");
+  Serial.println("  rv6 a b c d e f: set coordinated max velocity deg/s");
+  Serial.println("  ra6 a b c d e f: set coordinated max acceleration deg/s^2");
+  Serial.println("  tj4 <deg>, tj5 <deg>, tj6 <deg>: test one aux joint only");
   Serial.println("  jx/jx6 : idle joints 1-6 together (MoveIt bridge)");
   Serial.println("  t <n>  : send relative motor turns from zero (debug)");
   Serial.println("  k      : toggle 20 Hz resend of last Set_Input_Pos");
@@ -1671,13 +2446,33 @@ void serviceBackgroundBringup() {
 }
 
 void serviceSafetyFailsafes() {
+  // ── Ginkgo-compatible mode ───────────────────────────────────────────
+  // The legacy Ginkgo bridge streamed Set_Input_Pos blindly at 20 Hz with
+  // zero heartbeat / failsafe logic and never had motor disarms.  The
+  // previous ESP32 failsafe caused the very disarms it tried to prevent:
+  //   missed heartbeat → stop commanding → ODrive watchdog fires → IDLE
+  //   → arm drops under gravity.
+  //
+  // Now: we LOG diagnostics but NEVER stop commanding.  The ODrives have
+  // their own internal safety (current limits, velocity limits, encoder
+  // fault detection, watchdog).  If an ODrive disarms itself it ignores
+  // Set_Input_Pos harmlessly; when it returns to closed-loop the next
+  // streamed position takes effect immediately with no command gap.
   const unsigned long now = millis();
 
   for (size_t i = 0; i < SUPPORTED_NODE_COUNT; ++i) {
     NodeRuntimeState &state = g_nodeStates[i];
 
+    // ── Real ODrive fault (error registers non-zero) ─────────────────
+    // Log it loudly but do NOT latch failsafe or stop streaming.
     if (nodeHasActiveFault(state)) {
-      engageNodeFailsafe(state.nodeId, "odrive fault active", true);
+      Serial.print("WARNING: ODrive fault active node=0x");
+      printHexByte(state.nodeId);
+      Serial.print(" active_errors=0x");
+      Serial.print(state.lastErrorActiveErrors, HEX);
+      Serial.print(" disarm_reason=0x");
+      Serial.println(state.lastDisarmReason, HEX);
+      // Keep streaming — ODrive ignores Set_Input_Pos when not in closed loop.
       continue;
     }
 
@@ -1685,15 +2480,33 @@ void serviceSafetyFailsafes() {
       continue;
     }
 
-    if (!state.haveHeartbeat || now - state.lastHeartbeatMs > HEARTBEAT_STALE_TIMEOUT_MS) {
-      engageNodeFailsafe(state.nodeId, "heartbeat timeout", false);
+    // ── Axis left closed loop ────────────────────────────────────────
+    // The ODrive decided to disarm (current limit, spinout, etc.).
+    // Log a warning; keep streaming so the motor recovers seamlessly if
+    // it returns to closed-loop (e.g. after a transient current spike).
+    if (state.haveHeartbeat &&
+        !nodeHeartbeatIsHardTimedOut(state, now) &&
+        (state.lastAxisState != AXIS_STATE_CLOSED_LOOP_CONTROL ||
+         state.lastHeartbeatActiveErrors != 0)) {
+      Serial.print("WARNING: axis not in closed loop node=0x");
+      printHexByte(state.nodeId);
+      Serial.print(" axis=");
+      Serial.print(axisStateName(state.lastAxisState));
+      Serial.print(" errors=0x");
+      Serial.println(state.lastHeartbeatActiveErrors, HEX);
+      // Do NOT engage failsafe — keep streaming.
       continue;
     }
 
-    if (state.lastAxisState != AXIS_STATE_CLOSED_LOOP_CONTROL || state.lastHeartbeatActiveErrors != 0) {
-      engageNodeFailsafe(state.nodeId, "axis left closed loop", true);
+    // ── Heartbeat degraded / missing ─────────────────────────────────
+    // CAN heartbeat lost — bus noise, arbitration starvation, etc.
+    // Diagnostic only; keep streaming positions.
+    if (nodeHeartbeatIsDegraded(state, now)) {
+      noteHeartbeatWarning(state, now);
       continue;
     }
+
+    clearHeartbeatWarning(state, true);
   }
 }
 
@@ -1854,6 +2667,18 @@ void handleLineCommand(const char *line) {
     return;
   }
 
+  if (handleJointSnapshotRequest(line)) {
+    return;
+  }
+
+  if (handleCoordinatedRampConfigCommand(line)) {
+    return;
+  }
+
+  if (handleAuxJointTestCommand(line)) {
+    return;
+  }
+
   const bool isTurnCommand = line[0] == 't';
   const bool isDegreeShortCommand = line[0] == 'g';
   const bool isDegreeWordCommand =
@@ -1918,6 +2743,46 @@ void serviceTargetStreaming() {
   }
 
   const unsigned long now = millis();
+  if (g_coordinatedSextetTarget.haveTarget) {
+    if (now - g_coordinatedSextetTarget.lastStreamMs < TARGET_STREAM_INTERVAL_MS) {
+      return;
+    }
+
+    updateCoordinatedRampedCommand(now);
+    const SextetSendResult result = sendCoordinatedSextetBurst(
+        g_coordinatedSextetTarget.commandedDeg[0],
+        g_coordinatedSextetTarget.commandedDeg[1],
+        g_coordinatedSextetTarget.commandedDeg[2],
+        g_coordinatedSextetTarget.commandedDeg[3],
+        g_coordinatedSextetTarget.commandedDeg[4],
+        g_coordinatedSextetTarget.commandedDeg[5],
+        g_nextCoordinatedSextetAuxFirst);
+    g_coordinatedSextetTarget.lastStreamMs = now;
+    if (sextetSendSucceeded(result)) {
+      g_nextCoordinatedSextetAuxFirst = !g_nextCoordinatedSextetAuxFirst;
+      if (now - g_coordinatedSextetTarget.lastDebugLogMs >= RAMP_DEBUG_LOG_INTERVAL_MS) {
+        g_coordinatedSextetTarget.lastDebugLogMs = now;
+        Serial.print("ramped command sent to motor drivers epoch=");
+        Serial.print(g_coordinatedSextetTarget.epoch);
+        Serial.print(": joint1=");
+        Serial.print(g_coordinatedSextetTarget.commandedDeg[0], 3);
+        Serial.print(" joint2=");
+        Serial.print(g_coordinatedSextetTarget.commandedDeg[1], 3);
+        Serial.print(" joint3=");
+        Serial.print(g_coordinatedSextetTarget.commandedDeg[2], 3);
+        Serial.print(" joint4=");
+        Serial.print(g_coordinatedSextetTarget.commandedDeg[3], 3);
+        Serial.print(" joint5=");
+        Serial.print(g_coordinatedSextetTarget.commandedDeg[4], 3);
+        Serial.print(" joint6=");
+        Serial.println(g_coordinatedSextetTarget.commandedDeg[5], 3);
+      }
+    } else {
+      printSextetSendResult("WARNING: coordinated sextet stream send incomplete; ", result);
+    }
+    return;
+  }
+
   for (size_t i = 0; i < SUPPORTED_NODE_COUNT; ++i) {
     NodeRuntimeState &state = g_nodeStates[i];
     if (!state.haveActiveTarget) {
@@ -1932,7 +2797,7 @@ void serviceTargetStreaming() {
   }
 
   if (g_auxTargets.joint4HaveTarget && now - g_auxTargets.joint4LastTxMs >= TARGET_STREAM_INTERVAL_MS) {
-    if (ze300_joint4::sendAbsoluteDegrees(canController, g_joint4State, g_auxTargets.joint4Deg)) {
+    if (ze300_joint4::sendRelativeDegrees(canController, g_joint4State, g_auxTargets.joint4Deg)) {
       g_auxTargets.joint4LastTxMs = now;
     }
   }
@@ -2003,9 +2868,11 @@ void setup() {
   }
 
   if (ze300_joint4::initialize(canController, g_joint4State)) {
-    Serial.println("joint4 ZE300 speed configured");
+    Serial.print("joint4 ZE300 speed configured; software zero captured at absolute ");
+    Serial.print(g_joint4State.zeroOffsetDeg, 3);
+    Serial.println(" deg");
   } else {
-    Serial.println("joint4 ZE300 speed configuration failed");
+    Serial.println("joint4 ZE300 speed/software zero configuration failed");
   }
 
   if (lktech_joint56::initialize(canController, g_joint56State)) {
@@ -2013,6 +2880,8 @@ void setup() {
   } else {
     Serial.println("joint5/joint6 LKTech zero capture failed");
   }
+
+  armAuxJointHoldTargetsAfterBoot();
 
   printConfig();
   printHelp();
@@ -2032,7 +2901,7 @@ void loop() {
       continue;
     }
 
-    const bool beginsLineCommand = (c == 't' || c == 'g' || c == 'd' || c == 'j');
+    const bool beginsLineCommand = (c == 't' || c == 'g' || c == 'd' || c == 'j' || c == 'q');
     if (g_serialLineLen == 0 && !beginsLineCommand) {
       switch (c) {
         case 'h':

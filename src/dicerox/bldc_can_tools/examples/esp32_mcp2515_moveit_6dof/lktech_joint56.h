@@ -26,9 +26,12 @@ struct JointConfig {
   double defaultOutputSpeedDps;
 };
 
+// Keep auxiliary manual/hold commands conservative. The Python bridge now
+// performs trajectory streaming with per-joint limits, so LKTech firmware speed
+// no longer needs to provide high global headroom.
 static constexpr JointConfig kJointConfigs[JOINT_COUNT] = {
-    {"joint5", 0x14E, 10.0, 60.0},
-    {"joint6", 0x14F, 10.0, 60.0},
+    {"joint5", 0x14E, 10.0, 20.0},
+    {"joint6", 0x14F, 10.0, 20.0},
 };
 
 struct JointRuntimeState {

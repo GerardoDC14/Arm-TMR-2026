@@ -20,7 +20,12 @@ MoveIt command line used by the bridge:
 Highlights:
 
 - automatic ODrive bringup at boot
+- automatic ZE300 joint4 speed setup and software-zero capture at boot
 - automatic LKTech motor-on and zero capture at boot
 - synchronized 6-joint packets from ROS 2
 - acceleration-limited smoothing in the bridge
 - fixed-rate target re-streaming on the ESP32 to reduce chopped motion
+- joint4 MoveIt targets are relative to the captured software zero, not the ZE300 hardware zero
+- the first joint4 command is limited to +/-30 degrees from captured zero to catch bad startup poses
+- heartbeat gaps first become a degraded warning; the ESP32 keeps feeding the last safe ODrive target during that window
+- only prolonged heartbeat loss or a confirmed ODrive fault/disarm escalates to a true ESP32 failsafe

@@ -8,15 +8,18 @@ servo_node:
       use_gazebo: false
 
       ## Incoming command properties
+      ## "unitless" = servo node scales [-1, 1] input by scale.linear/rotational below.
+      ## Teleop nodes (spacemouse_servo, joystick_servo, keyboard_servo) should output
+      ## values in [-1, 1] range; the scale values here are the single velocity tuning point.
       command_in_type: "unitless"
       scale:
-        linear: 0.2
-        rotational: 0.35
-        joint: 0.35
+        linear:     0.3    # max Cartesian translational velocity [m/s] at full stick deflection
+        rotational: 0.6    # max Cartesian rotational velocity [rad/s] at full stick deflection
+        joint:      1.0    # max joint velocity [rad/s] for joint jog mode
 
       ## Outgoing command properties
-      publish_period: 0.034
-      low_latency_mode: false
+      ## 50 Hz matches the spacemouse_servo publish_rate_hz — keeps latency low.
+      publish_period: 0.020
 
       command_out_type: trajectory_msgs/JointTrajectory
       publish_joint_positions: true
@@ -24,6 +27,10 @@ servo_node:
       publish_joint_accelerations: false
 
       ## Smoothing
+      ## low_latency_mode: true bypasses the servo-side Butterworth filter.
+      ## The spacemouse_servo node already applies EMA smoothing (alpha=0.65)
+      ## so double-filtering here only adds lag without benefit.
+      low_latency_mode: true
       smoothing_filter_plugin_name: "online_signal_smoothing::ButterworthFilterPlugin"
 
       ## Planning scene — set false when move_group is running alongside servo
@@ -42,10 +49,16 @@ servo_node:
       num_outgoing_halt_msgs_to_publish: 4
 
       ## Singularity / joint limit handling
+      ## lower_singularity_threshold: condition number where servo starts decelerating.
+      ## hard_stop_singularity_threshold: condition number for emergency stop.
+      ## leaving_singularity_threshold_multiplier: hysteresis.  The arm must reach
+      ##   condition_number < lower/multiplier to be considered "leaving".
+      ##   Was 2.0 (needing to drop to 60) — caused oscillation near the boundary.
+      ##   1.3 gives a narrower hysteresis band and reduces approach/leave ping-pong.
       lower_singularity_threshold: 120.0
       hard_stop_singularity_threshold: 300.0
       joint_limit_margin: 0.1
-      leaving_singularity_threshold_multiplier: 2.0
+      leaving_singularity_threshold_multiplier: 1.3
 
       ## Topic names
       cartesian_command_in_topic: ~/delta_twist_cmds

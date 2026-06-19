@@ -34,10 +34,21 @@ constexpr uint32_t AXIS_STATE_CLOSED_LOOP_CONTROL = 8;
 
 constexpr uint16_t MAX_RX_FRAMES_PER_PASS = 64;
 constexpr size_t SERIAL_LINE_BUFFER_SIZE = 64;
-constexpr uint32_t SERIAL_BAUD_RATE = 115200;
+// 921600 reduces serial write time per command from ~3.3 ms to ~0.4 ms.
+// Supported by CH340G, CP2102, FTDI and the Jetson native UART.
+// Risk: noisy or long USB cables may cause errors; drop to 460800 if needed.
+constexpr uint32_t SERIAL_BAUD_RATE = 921600;
 constexpr uint32_t TARGET_STREAM_INTERVAL_MS = 50;
 constexpr uint32_t ENCODER_TELEMETRY_INTERVAL_MS = 100;
-constexpr uint32_t HEARTBEAT_STALE_TIMEOUT_MS = 800;
+// Treat brief heartbeat gaps as a degraded-telemetry warning first.  The
+// shared ESP32+MCP2515 bus can miss heartbeats during arbitration starvation,
+// RX filter pressure, or noisy recovery windows even while Set_Input_Pos still
+// reaches the ODrive.  The legacy Ginkgo path kept streaming commands without
+// a runtime heartbeat watchdog, so heartbeat loss is diagnostic-only by
+// default here unless a separate hard-timeout is explicitly configured.
+constexpr uint32_t HEARTBEAT_WARNING_TIMEOUT_MS = 800;
+constexpr uint32_t HEARTBEAT_HARD_TIMEOUT_MS = 0;
+constexpr uint32_t HEARTBEAT_WARNING_LOG_INTERVAL_MS = 1000;
 constexpr uint32_t ENCODER_STALE_TIMEOUT_MS = 800;
 constexpr uint32_t ERROR_STATUS_STALE_TIMEOUT_MS = 1500;
 constexpr uint32_t CLOSED_LOOP_CONFIRM_TIMEOUT_MS = 1200;
@@ -75,6 +86,7 @@ struct NodeRuntimeState {
   bool haveHeartbeat;
   bool haveErrorStatus;
   bool failsafeLatched;
+  bool heartbeatWarningActive;
   float lastEncoderPosTurns;
   float lastEncoderVelTurnsPerSecond;
   float zeroReferenceTurns;
@@ -90,6 +102,7 @@ struct NodeRuntimeState {
   unsigned long lastErrorMs;
   unsigned long lastEncoderEstimateMs;
   unsigned long lastEncoderTelemetryPrintMs;
+  unsigned long lastHeartbeatWarningLogMs;
   unsigned long lastFailsafeMs;
 };
 
@@ -184,10 +197,51 @@ inline float motorTurnsToJointDegrees(uint8_t nodeId, float motorTurns) {
   return (motorTurns / scale) * 360.0f;
 }
 
+inline unsigned long heartbeatAgeMs(const NodeRuntimeState &state, unsigned long now = millis()) {
+  if (!state.haveHeartbeat) {
+    return 0xFFFFFFFFUL;
+  }
+  return now - state.lastHeartbeatMs;
+}
+
+inline bool heartbeatHardTimeoutEnabled() {
+  return HEARTBEAT_HARD_TIMEOUT_MS > HEARTBEAT_WARNING_TIMEOUT_MS;
+}
+
+inline bool nodeHeartbeatIsDegraded(const NodeRuntimeState &state, unsigned long now = millis()) {
+  if (!state.haveHeartbeat) {
+    return false;
+  }
+  const unsigned long ageMs = heartbeatAgeMs(state, now);
+  if (ageMs <= HEARTBEAT_WARNING_TIMEOUT_MS) {
+    return false;
+  }
+  if (!heartbeatHardTimeoutEnabled()) {
+    return true;
+  }
+  return ageMs <= HEARTBEAT_HARD_TIMEOUT_MS;
+}
+
+inline bool nodeHeartbeatIsHardTimedOut(const NodeRuntimeState &state, unsigned long now = millis()) {
+  return heartbeatHardTimeoutEnabled() &&
+         (!state.haveHeartbeat || heartbeatAgeMs(state, now) > HEARTBEAT_HARD_TIMEOUT_MS);
+}
+
+inline const char *heartbeatStateName(const NodeRuntimeState &state, unsigned long now = millis()) {
+  if (!state.haveHeartbeat) {
+    return "missing";
+  }
+  if (nodeHeartbeatIsHardTimedOut(state, now)) {
+    return "hard-timeout";
+  }
+  if (nodeHeartbeatIsDegraded(state, now)) {
+    return "degraded";
+  }
+  return "fresh";
+}
+
 inline bool nodeIsInClosedLoop(const NodeRuntimeState &state) {
-  const unsigned long now = millis();
   return state.haveHeartbeat &&
-         now - state.lastHeartbeatMs <= HEARTBEAT_STALE_TIMEOUT_MS &&
          state.lastAxisState == AXIS_STATE_CLOSED_LOOP_CONTROL &&
          state.lastHeartbeatActiveErrors == 0;
 }
