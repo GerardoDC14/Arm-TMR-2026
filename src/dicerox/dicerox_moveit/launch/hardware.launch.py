@@ -87,6 +87,7 @@ def generate_launch_description():
         "motor_initialization_timeout_sec"
     )
     firmware_status_timeout_sec = LaunchConfiguration("firmware_status_timeout_sec")
+    can_fault_strict_debug = LaunchConfiguration("can_fault_strict_debug")
 
     moveit_config = (
         MoveItConfigsBuilder("Dicerox_robot_arm_URDF", package_name="dicerox_moveit")
@@ -290,6 +291,14 @@ def generate_launch_description():
                 default_value="2.0",
                 description="Maximum time to wait for a status6 response.",
             ),
+            DeclareLaunchArgument(
+                "can_fault_strict_debug",
+                default_value="false",
+                description=(
+                    "Bench-only strict CAN fault thresholds and fault injection gate. "
+                    "Keep false during normal operation."
+                ),
+            ),
             LogInfo(
                 msg=(
                     "Dicerox hardware MoveIt launch: do not run demo.launch.py at "
@@ -397,6 +406,9 @@ def generate_launch_description():
                         ),
                         "firmware_status_timeout_sec": ParameterValue(
                             firmware_status_timeout_sec, value_type=float
+                        ),
+                        "can_fault_strict_debug": ParameterValue(
+                            can_fault_strict_debug, value_type=bool
                         ),
                     }
                 ],

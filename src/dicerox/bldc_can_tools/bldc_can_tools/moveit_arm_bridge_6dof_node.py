@@ -280,6 +280,7 @@ class MoveItArmBridge6DofNode(Node):  # type: ignore[misc]
         self.declare_parameter("auto_initialize_motors", False)
         self.declare_parameter("motor_initialization_timeout_sec", 20.0)
         self.declare_parameter("firmware_status_timeout_sec", 2.0)
+        self.declare_parameter("can_fault_strict_debug", False)
 
         # ── Read parameters ───────────────────────────────────────────────
         self.serial_port              = str(self.get_parameter("serial_port").value)
@@ -427,6 +428,8 @@ class MoveItArmBridge6DofNode(Node):  # type: ignore[misc]
             self.get_parameter("motor_initialization_timeout_sec").value)
         self.firmware_status_timeout_sec = float(
             self.get_parameter("firmware_status_timeout_sec").value)
+        self.can_fault_strict_debug = bool(
+            self.get_parameter("can_fault_strict_debug").value)
 
         if self.command_rate_hz <= 0.0:
             raise ValueError("command_rate_hz must be > 0")
@@ -608,6 +611,9 @@ class MoveItArmBridge6DofNode(Node):  # type: ignore[misc]
         self._status_srv = self.create_service(
             Trigger, "~/status", self._handle_status_service,
             callback_group=self._callback_group)
+        self._inject_can_fault_srv = self.create_service(
+            Trigger, "~/inject_can_fault", self._handle_inject_can_fault_service,
+            callback_group=self._callback_group)
         self._request_snapshot_srv = self.create_service(
             Trigger, "~/request_hardware_snapshot", self._handle_request_snapshot_service,
             callback_group=self._callback_group)
@@ -678,6 +684,7 @@ class MoveItArmBridge6DofNode(Node):  # type: ignore[misc]
             f"joint_limit_epsilon={self.joint_limit_epsilon_deg:.3f}deg "
             f"auto_initialize_motors={self.auto_initialize_motors} "
             f"motor_init_timeout={self.motor_initialization_timeout_sec:.1f}s "
+            f"can_fault_strict_debug={self.can_fault_strict_debug} "
             f"allow_dry_run_without_active={self.allow_dry_run_without_active_hardware}; "
             f"mappings: {summary}"
         )
@@ -1044,7 +1051,15 @@ class MoveItArmBridge6DofNode(Node):  # type: ignore[misc]
         self._state = BridgeState.MOTORS_INITIALIZING
         self._motors_initialized = False
         self._firmware_fault_reason = None
-        self.get_logger().warn("Motor initialization started: sending init6")
+        self.get_logger().warn(
+            "Motor initialization started: configuring CAN diagnostics then sending init6")
+        strict_command = "cfs6 on" if self.can_fault_strict_debug else "cfs6 off"
+        strict_ok, strict_message = self._request_firmware_line(
+            strict_command, "cfs6ok", "cfs6err", self.firmware_status_timeout_sec)
+        if not strict_ok:
+            self._state = BridgeState.MOTORS_UNINITIALIZED
+            self._firmware_fault_reason = strict_message
+            return False, f"failed to configure CAN fault debug mode: {strict_message}"
         ok, message = self._request_firmware_line(
             "init6", "init6ok", "init6err", self.motor_initialization_timeout_sec)
         if not ok:
@@ -1082,6 +1097,27 @@ class MoveItArmBridge6DofNode(Node):  # type: ignore[misc]
             "status6", "status6 ", "status6err", self.firmware_status_timeout_sec)
         if ok:
             self._latest_firmware_status = detail
+        response.success = ok
+        response.message = detail
+        return response
+
+    def _handle_inject_can_fault_service(self, request, response):  # type: ignore[no-untyped-def]
+        del request
+        if self.dry_run or not self.enable_hardware_motion:
+            response.success = False
+            response.message = "fault injection requires real enabled hardware mode"
+            return response
+        if not self.can_fault_strict_debug:
+            response.success = False
+            response.message = (
+                "fault injection blocked: launch with can_fault_strict_debug:=true")
+            return response
+        ok, detail = self._request_firmware_line(
+            "testfault6 can_bus_lost",
+            "fault6 can_bus_lost injected=true",
+            "testfault6err",
+            self.firmware_status_timeout_sec,
+        )
         response.success = ok
         response.message = detail
         return response
@@ -2691,10 +2727,16 @@ class MoveItArmBridge6DofNode(Node):  # type: ignore[misc]
                     )
                 else:
                     if have_fresh_joint_targets and not joint_states_may_command_hardware:
-                        source_desc = (
-                            "joint_states are feedback-only in real hardware mode; "
-                            "holding last hardware command"
-                        )
+                        if self.joint_state_source_mode == "trusted_open_loop":
+                            source_desc = (
+                                "trusted_open_loop: using commanded joint_states for "
+                                "MoveIt/RViz synchronization; holding last commanded target"
+                            )
+                        else:
+                            source_desc = (
+                                "hardware feedback joint_states do not directly command "
+                                "motors; holding last hardware command"
+                            )
                     else:
                         source_desc = f"no fresh joint_states for {joint_age_sec:.2f}s"
                 action = "sending idle" if self.idle_on_stale else "holding last targets"

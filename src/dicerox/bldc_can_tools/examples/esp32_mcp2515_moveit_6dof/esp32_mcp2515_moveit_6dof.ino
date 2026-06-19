@@ -126,6 +126,12 @@ FirmwareState g_firmwareState = FirmwareState::MotorsUninitialized;
 bool g_motorsInitialized = false;
 uint8_t g_canSendFailCount = 0;
 uint8_t g_motorCommandFailCount = 0;
+uint32_t g_canSendFailCountTotal = 0;
+uint32_t g_canIncompleteBurstCount = 0;
+uint32_t g_jointCommandFailCount[COORDINATED_JOINT_COUNT] = {};
+uint32_t g_canLastFailedId = 0;
+int g_canLastFailedCode = static_cast<int>(MCP2515::ERROR_OK);
+bool g_canFaultStrictDebug = false;
 unsigned long g_canFaultWindowStartMs = 0;
 unsigned long g_motorFaultWindowStartMs = 0;
 char g_lastFirmwareFault[96] = "none";
@@ -229,6 +235,50 @@ void noteCanSendResult(bool success, const char *context);
 void noteMotorCommandResult(bool success, const char *context);
 void serviceCanHealth();
 bool handleLifecycleCommand(const char *line);
+const char *mcp2515ErrorName(int code);
+void printEflgFlags(uint8_t eflg);
+uint8_t activeCanSendFailThreshold();
+uint8_t activeMotorCommandFailThreshold();
+
+const char *mcp2515ErrorName(int code) {
+  switch (code) {
+    case MCP2515::ERROR_OK: return "ERROR_OK";
+    case MCP2515::ERROR_FAIL: return "ERROR_FAIL";
+    case MCP2515::ERROR_ALLTXBUSY: return "ERROR_ALLTXBUSY";
+    case MCP2515::ERROR_FAILINIT: return "ERROR_FAILINIT";
+    case MCP2515::ERROR_FAILTX: return "ERROR_FAILTX";
+    case MCP2515::ERROR_NOMSG: return "ERROR_NOMSG";
+    case -1: return "DRIVER_BOOL_FAILURE";
+    default: return "ERROR_UNKNOWN";
+  }
+}
+
+void printEflgFlags(uint8_t eflg) {
+  bool printed = false;
+  auto emit = [&](uint8_t mask, const char *name) {
+    if ((eflg & mask) == 0) return;
+    if (printed) Serial.print(',');
+    Serial.print(name);
+    printed = true;
+  };
+  emit(MCP2515::EFLG_RX1OVR, "RX1OVR");
+  emit(MCP2515::EFLG_RX0OVR, "RX0OVR");
+  emit(MCP2515::EFLG_TXBO, "TXBO");
+  emit(MCP2515::EFLG_TXEP, "TXEP");
+  emit(MCP2515::EFLG_RXEP, "RXEP");
+  emit(MCP2515::EFLG_TXWAR, "TXWAR");
+  emit(MCP2515::EFLG_RXWAR, "RXWAR");
+  emit(MCP2515::EFLG_EWARN, "EWARN");
+  if (!printed) Serial.print("NONE");
+}
+
+uint8_t activeCanSendFailThreshold() {
+  return g_canFaultStrictDebug ? 2 : CAN_SEND_FAIL_THRESHOLD;
+}
+
+uint8_t activeMotorCommandFailThreshold() {
+  return g_canFaultStrictDebug ? 2 : MOTOR_COMMAND_FAIL_THRESHOLD;
+}
 
 const char *firmwareStateName(FirmwareState state) {
   switch (state) {
@@ -1132,12 +1182,16 @@ bool sendFrame(const can_frame &frame, const char *message = nullptr, bool logFr
 
   const MCP2515::ERROR sendResult = canController.sendMessage(&tx);
   if (sendResult != MCP2515::ERROR_OK) {
-    noteCanSendResult(false, "odrive_send");
     const uint32_t arbitrationId = isExtendedFrame(tx)
                                        ? (tx.can_id & 0x1FFFFFFFUL)
                                        : getStandardId(tx);
+    g_canLastFailedId = arbitrationId;
+    g_canLastFailedCode = static_cast<int>(sendResult);
+    noteCanSendResult(false, "odrive_send");
     Serial.print("ERROR: send failed code=");
     Serial.print(static_cast<int>(sendResult));
+    Serial.print(" meaning=");
+    Serial.print(mcp2515ErrorName(static_cast<int>(sendResult)));
     Serial.print(" bitrate=");
     Serial.print(bitrateName(g_bitrate));
     Serial.print(" oscillator=");
@@ -1160,19 +1214,25 @@ bool sendFrame(const can_frame &frame, const char *message = nullptr, bool logFr
 }
 
 void noteCanSendResult(bool success, const char *context) {
+  const unsigned long now = millis();
   if (success) {
-    g_canSendFailCount = 0;
+    if (g_canFaultWindowStartMs != 0 &&
+        now - g_canFaultWindowStartMs > CAN_FAULT_WINDOW_MS) {
+      g_canSendFailCount = 0;
+      g_canFaultWindowStartMs = 0;
+    }
     return;
   }
-  const unsigned long now = millis();
   if (g_canFaultWindowStartMs == 0 || now - g_canFaultWindowStartMs > CAN_FAULT_WINDOW_MS) {
     g_canFaultWindowStartMs = now;
     g_canSendFailCount = 0;
   }
+  ++g_canSendFailCountTotal;
   if (g_canSendFailCount < 255) {
     ++g_canSendFailCount;
   }
-  if (g_canSendFailCount >= CAN_SEND_FAIL_THRESHOLD && g_firmwareState != FirmwareState::FaultCan) {
+  if (g_canSendFailCount >= activeCanSendFailThreshold() &&
+      g_firmwareState != FirmwareState::FaultCan) {
     char reason[96] = {};
     snprintf(reason, sizeof(reason), "can_bus_lost context=%s failures=%u",
              context != nullptr ? context : "unknown", g_canSendFailCount);
@@ -1197,7 +1257,7 @@ void noteMotorCommandResult(bool success, const char *context) {
   if (g_motorCommandFailCount < 255) {
     ++g_motorCommandFailCount;
   }
-  if (g_motorCommandFailCount >= MOTOR_COMMAND_FAIL_THRESHOLD) {
+  if (g_motorCommandFailCount >= activeMotorCommandFailThreshold()) {
     char reason[96] = {};
     snprintf(reason, sizeof(reason), "motor_command_failed context=%s failures=%u",
              context != nullptr ? context : "unknown", g_motorCommandFailCount);
@@ -1848,6 +1908,7 @@ void enterCanFault(const char *reason) {
   if (g_firmwareState == FirmwareState::FaultCan) {
     return;
   }
+  const bool motorsWereInitialized = g_motorsInitialized;
   g_firmwareState = FirmwareState::FaultCan;
   g_motorsInitialized = false;
   clearCoordinatedSextetTarget();
@@ -1859,7 +1920,7 @@ void enterCanFault(const char *reason) {
   Serial.print("fault6 ");
   Serial.println(g_lastFirmwareFault);
   Serial.println("WARNING: CAN fault latched; motor stop cannot be guaranteed if drivers are unreachable");
-  if (CAN_FAULT_DISARM_IF_REACHABLE && modeAllowsTransmit(g_mode)) {
+  if (motorsWereInitialized && CAN_FAULT_DISARM_IF_REACHABLE && modeAllowsTransmit(g_mode)) {
     Serial.println("CAN fault policy: attempting one best-effort motor disable/stop");
     (void)sendAxisStateRequestToNode(NODE_ID_10, AXIS_STATE_IDLE, nullptr, false);
     (void)sendAxisStateRequestToNode(NODE_ID_11, AXIS_STATE_IDLE, nullptr, false);
@@ -1871,12 +1932,39 @@ void enterCanFault(const char *reason) {
 
 void printFirmwareStatus6() {
   const uint8_t eflg = canController.getErrorFlags();
+  const unsigned long now = millis();
+  if (g_canFaultWindowStartMs != 0 && now - g_canFaultWindowStartMs > CAN_FAULT_WINDOW_MS) {
+    g_canSendFailCount = 0;
+    g_canFaultWindowStartMs = 0;
+  }
+  if (g_motorFaultWindowStartMs != 0 && now - g_motorFaultWindowStartMs > CAN_FAULT_WINDOW_MS) {
+    g_motorCommandFailCount = 0;
+    g_motorFaultWindowStartMs = 0;
+  }
   Serial.print("status6 state=");
   Serial.print(firmwareStateName(g_firmwareState));
   Serial.print(" can_ready=");
   Serial.print(g_canControllerReady && modeAllowsTransmit(g_mode) ? "true" : "false");
-  Serial.print(" eflg=0x");
+  Serial.print(" mcp2515_eflg=0x");
   Serial.print(eflg, HEX);
+  Serial.print(" mcp2515_eflg_flags=");
+  printEflgFlags(eflg);
+  Serial.print(" can_send_fail_count_total=");
+  Serial.print(g_canSendFailCountTotal);
+  Serial.print(" can_send_fail_count_window=");
+  Serial.print(g_canSendFailCount);
+  Serial.print(" can_incomplete_burst_count=");
+  Serial.print(g_canIncompleteBurstCount);
+  Serial.print(" can_last_failed_id=0x");
+  Serial.print(g_canLastFailedId, HEX);
+  Serial.print(" can_last_failed_code=");
+  Serial.print(g_canLastFailedCode);
+  Serial.print(" can_last_failed_code_name=");
+  Serial.print(mcp2515ErrorName(g_canLastFailedCode));
+  Serial.print(" can_last_fault_reason=");
+  Serial.print(g_lastFirmwareFault);
+  Serial.print(" can_fault_strict_debug=");
+  Serial.print(g_canFaultStrictDebug ? "true" : "false");
   Serial.print(" motors_initialized=");
   Serial.print(g_motorsInitialized ? "true" : "false");
   for (size_t i = 0; i < SUPPORTED_NODE_COUNT; ++i) {
@@ -1892,19 +1980,37 @@ void printFirmwareStatus6() {
     Serial.print(i + 1);
     Serial.print("_err=0x");
     Serial.print(g_nodeStates[i].lastHeartbeatActiveErrors, HEX);
+    Serial.print(" j");
+    Serial.print(i + 1);
+    Serial.print("_heartbeat_age_ms=");
+    if (g_nodeStates[i].haveHeartbeat) {
+      Serial.print(heartbeatAgeMs(g_nodeStates[i], now));
+    } else {
+      Serial.print("unavailable");
+    }
+    Serial.print(" j");
+    Serial.print(i + 1);
+    Serial.print("_command_fail_count=");
+    Serial.print(g_jointCommandFailCount[i]);
   }
   Serial.print(" j4_ready=");
   Serial.print(g_joint4State.speedConfigured && g_joint4State.haveSoftwareZero ? "true" : "false");
   Serial.print(" j4_zero=");
   Serial.print(g_joint4State.haveSoftwareZero ? "true" : "false");
+  Serial.print(" j4_command_fail_count=");
+  Serial.print(g_jointCommandFailCount[3]);
   Serial.print(" j5_ready=");
   Serial.print(g_joint56State.joints[0].enabled && g_joint56State.joints[0].haveZero ? "true" : "false");
   Serial.print(" j5_zero=");
   Serial.print(g_joint56State.joints[0].haveZero ? "true" : "false");
+  Serial.print(" j5_command_fail_count=");
+  Serial.print(g_jointCommandFailCount[4]);
   Serial.print(" j6_ready=");
   Serial.print(g_joint56State.joints[1].enabled && g_joint56State.joints[1].haveZero ? "true" : "false");
   Serial.print(" j6_zero=");
   Serial.print(g_joint56State.joints[1].haveZero ? "true" : "false");
+  Serial.print(" j6_command_fail_count=");
+  Serial.print(g_jointCommandFailCount[5]);
   Serial.print(" coordinated_allowed=");
   Serial.print(g_motorsInitialized && g_firmwareState == FirmwareState::MotorsReady ? "true" : "false");
   Serial.print(" fault=");
@@ -1999,6 +2105,28 @@ bool handleLifecycleCommand(const char *line) {
       clearCoordinatedSextetTarget();
       Serial.println("hold6ok last motor targets retained; coordinated trajectory stopped");
     }
+    return true;
+  }
+  if (strcmp(line, "cfs6 on") == 0 || strcmp(line, "cfs6 off") == 0) {
+    g_canFaultStrictDebug = strcmp(line, "cfs6 on") == 0;
+    Serial.print("cfs6ok enabled=");
+    Serial.print(g_canFaultStrictDebug ? "true" : "false");
+    Serial.print(" send_threshold=");
+    Serial.print(activeCanSendFailThreshold());
+    Serial.print(" motor_threshold=");
+    Serial.println(activeMotorCommandFailThreshold());
+    return true;
+  }
+  if (strncmp(line, "testfault6", 10) == 0) {
+    if (!g_canFaultStrictDebug) {
+      Serial.println("testfault6err strict_debug_disabled");
+      return true;
+    }
+    if (strcmp(line, "testfault6 can_bus_lost") != 0) {
+      Serial.println("testfault6err usage=testfault6_can_bus_lost");
+      return true;
+    }
+    enterCanFault("can_bus_lost injected=true");
     return true;
   }
   return false;
@@ -2446,6 +2574,8 @@ void printHelp() {
   Serial.println("  status6: report firmware/CAN/motor/zero readiness");
   Serial.println("  hold6  : stop coordinated trajectory updates and retain last driver targets");
   Serial.println("  disarm6: disable/stop all reachable motors; re-init required");
+  Serial.println("  cfs6 on|off: strict CAN fault thresholds for bench validation");
+  Serial.println("  testfault6 can_bus_lost: inject fault (requires cfs6 on)");
   Serial.println("  qjs6   : query real measured joint snapshot; replies js6 or js6err");
   Serial.println("  rl6    : print coordinated firmware ramp limits");
   Serial.println("  rv6 a b c d e f: set coordinated max velocity deg/s");
@@ -3073,6 +3203,29 @@ void serviceTargetStreaming() {
         Serial.println(g_coordinatedSextetTarget.commandedDeg[5], 3);
       }
     } else {
+      ++g_canIncompleteBurstCount;
+      const bool jointOk[COORDINATED_JOINT_COUNT] = {
+          result.ok1, result.ok2, result.ok3, result.ok4, result.ok5, result.ok6};
+      const uint32_t jointCanIds[COORDINATED_JOINT_COUNT] = {
+          makeCanId(NODE_ID_10, CMD_SET_INPUT_POS),
+          makeCanId(NODE_ID_11, CMD_SET_INPUT_POS),
+          makeCanId(NODE_ID_12, CMD_SET_INPUT_POS),
+          ze300_joint4::requestId(),
+          lktech_joint56::kJointConfigs[0].canId,
+          lktech_joint56::kJointConfigs[1].canId,
+      };
+      for (size_t i = 0; i < COORDINATED_JOINT_COUNT; ++i) {
+        if (jointOk[i]) continue;
+        ++g_jointCommandFailCount[i];
+        // ODrive failures were already recorded with the exact library code
+        // by sendFrame(). Aux helpers currently return bool, so preserve an
+        // explicit synthetic code instead of guessing the library result.
+        if (i >= 3) {
+          g_canLastFailedId = jointCanIds[i];
+          g_canLastFailedCode = -1;
+          noteCanSendResult(false, "aux_coordinated_send");
+        }
+      }
       printSextetSendResult("WARNING: coordinated sextet stream send incomplete; ", result);
       noteMotorCommandResult(false, "coordinated_sextet");
     }
@@ -3098,6 +3251,11 @@ void serviceTargetStreaming() {
     noteMotorCommandResult(ok, "joint4");
     if (ok) {
       g_auxTargets.joint4LastTxMs = now;
+    } else {
+      ++g_jointCommandFailCount[3];
+      g_canLastFailedId = ze300_joint4::requestId();
+      g_canLastFailedCode = -1;
+      noteCanSendResult(false, "joint4");
     }
   }
 
@@ -3107,6 +3265,11 @@ void serviceTargetStreaming() {
     noteMotorCommandResult(ok, "joint5");
     if (ok) {
       g_auxTargets.joint5LastTxMs = now;
+    } else {
+      ++g_jointCommandFailCount[4];
+      g_canLastFailedId = lktech_joint56::kJointConfigs[0].canId;
+      g_canLastFailedCode = -1;
+      noteCanSendResult(false, "joint5");
     }
   }
 
@@ -3116,6 +3279,11 @@ void serviceTargetStreaming() {
     noteMotorCommandResult(ok, "joint6");
     if (ok) {
       g_auxTargets.joint6LastTxMs = now;
+    } else {
+      ++g_jointCommandFailCount[5];
+      g_canLastFailedId = lktech_joint56::kJointConfigs[1].canId;
+      g_canLastFailedCode = -1;
+      noteCanSendResult(false, "joint6");
     }
   }
 }
@@ -3218,7 +3386,7 @@ void loop() {
 
     const bool beginsLineCommand =
         (c == 't' || c == 'g' || c == 'd' || c == 'j' || c == 'q' ||
-         c == 'i' || c == 's' || c == 'h');
+         c == 'i' || c == 's' || c == 'h' || c == 'c');
     if (g_serialLineLen == 0 && !beginsLineCommand) {
       switch (c) {
         case 'h':

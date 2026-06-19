@@ -56,9 +56,17 @@ status6     report firmware, CAN, motor-ready, zero-valid, and fault state
 hold6       stop coordinated target updates and retain the last driver targets
 disarm6     best-effort disable/stop all reachable motors; re-init required
 jx6         legacy disable/loose command; re-init required (not hold)
+cfs6 on|off enable strict CAN fault thresholds for bench validation
+testfault6 can_bus_lost  inject a latched fault; requires cfs6 on
 ```
 
 CAN faults are latched as `fault6 ...`; new `j6` targets are rejected until a
 new explicit `init6` succeeds. If CAN is physically disconnected, firmware can
 detect and report the loss but cannot guarantee that stop commands reach the
 motor drivers.
+
+`status6` decodes MCP2515 EFLG bits and reports total/windowed send failures,
+incomplete bursts, last failed ID and library code, per-joint failure counts,
+and ODrive heartbeat ages. With the installed `autowp-mcp2515` library,
+`0x80` is `RX1OVR`, return code `2` is `ERROR_ALLTXBUSY`, and return code `4`
+is `ERROR_FAILTX`.

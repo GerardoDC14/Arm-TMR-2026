@@ -214,6 +214,7 @@ firmware_status_timeout_sec := 2.0
 trusted_open_loop_hold_after_action := true
 trusted_open_loop_hold_rate_hz := 10.0
 idle_on_action_cancel := false
+can_fault_strict_debug := false
 ```
 
 ### Serial commands
@@ -225,6 +226,8 @@ hold6
 disarm6
 jx6
 j6 <j1_deg> <j2_deg> <j3_deg> <j4_deg> <j5_deg> <j6_deg>
+cfs6 on|off
+testfault6 can_bus_lost
 ```
 
 - `init6` initializes all motor controllers and captures relative zero references.
@@ -233,6 +236,8 @@ j6 <j1_deg> <j2_deg> <j3_deg> <j4_deg> <j5_deg> <j6_deg>
 - `disarm6` disables/stops reachable motors and invalidates motion readiness.
 - `jx6` is a disable/loose command, not a hold command.
 - `j6 ...` updates the coordinated six-joint target; firmware ramping prevents jumps.
+- `cfs6 on|off` enables stricter CAN fault thresholds for bench validation.
+- `testfault6 can_bus_lost` injects a fault and requires strict debug mode.
 
 ROS lifecycle services:
 
@@ -241,6 +246,7 @@ ROS lifecycle services:
 /moveit_arm_bridge_6dof/status
 /moveit_arm_bridge_6dof/rearm
 /moveit_arm_bridge_6dof/disarm
+/moveit_arm_bridge_6dof/inject_can_fault
 ```
 
 ### Trusted open loop
@@ -264,6 +270,22 @@ new motion until explicit initialization and rearm.
 If the CAN bus is physically disconnected, the ESP32 cannot guarantee that a
 stop or disable command reaches the motor drivers. Mechanical support and
 hardware-level emergency protection remain necessary.
+
+`status6` includes decoded MCP2515 EFLG flags, total and in-window send
+failures, incomplete burst count, last failed CAN ID/code/name, per-joint
+failure counters, and ODrive heartbeat ages. A non-motion propagation test is:
+
+```bash
+ros2 launch dicerox_moveit hardware.launch.py \
+  dry_run:=false enable_hardware_motion:=true \
+  joint_state_source_mode:=trusted_open_loop can_fault_strict_debug:=true
+
+ros2 service call /moveit_arm_bridge_6dof/inject_can_fault \
+  std_srvs/srv/Trigger "{}"
+```
+
+The injected `fault6 can_bus_lost injected=true` follows the real bridge fault
+path and requires another initialization and rearm.
 
 ### Dicerox teleoperation
 
